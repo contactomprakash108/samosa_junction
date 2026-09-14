@@ -1,0 +1,9 @@
+samosa:
+  kafka:
+    enabled: false
+  s3:
+    enabled: false
+    local-root: ${java.io.tmpdir}/samosa-test-object-storage
+    signing-key: test-object-signing-key-32-bytes!!
+  outbox:
+    poller-enabled: false

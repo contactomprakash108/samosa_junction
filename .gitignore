@@ -1,0 +1,41 @@
+# Maven
+backend/target/
+backend/.mvn/wrapper/maven-wrapper.jar
+
+# IDE
+.idea/
+*.iml
+.project
+.classpath
+.settings/
+.vscode/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Environment / secrets
+.env
+*.pem
+*.p12
+*.jks
+
+# Logs
+*.log
+logs/
+
+# Python (future ai-service)
+__pycache__/
+.venv/
+venv/
+*.pyc
+
+# Local object storage when S3 is off
+data/object-storage/
+backend/data/object-storage/
+
+# Frontend
+frontend/node_modules/
+frontend/dist/
+

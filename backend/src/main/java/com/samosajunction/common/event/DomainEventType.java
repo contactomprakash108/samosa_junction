@@ -1,0 +1,17 @@
+package com.samosajunction.common.event;
+
+public enum DomainEventType {
+    ORDER_CREATED,
+    ORDER_CONFIRMED,
+    ORDER_PREPARING,
+    ORDER_READY,
+    ORDER_OUT_FOR_DELIVERY,
+    ORDER_DELIVERED,
+    ORDER_CANCELLED,
+    PAYMENT_SUCCESS,
+    PAYMENT_FAILED,
+    WALLET_DEBITED,
+    COMPLAINT_CREATED,
+    COMPLAINT_UPDATED,
+    PASSWORD_RESET
+}
