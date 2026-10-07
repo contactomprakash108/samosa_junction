@@ -6,6 +6,9 @@ import com.samosajunction.auth.dto.ForgotPasswordResponse;
 import com.samosajunction.auth.dto.MessageResponse;
 import com.samosajunction.auth.security.JwtService;
 import com.samosajunction.auth.service.AuthService;
+import com.samosajunction.auth.service.LoginRateLimiter;
+import com.samosajunction.auth.service.RefreshTokenService;
+import com.samosajunction.auth.support.SecurityAuditLogger;
 import com.samosajunction.common.exception.UnauthorizedException;
 import com.samosajunction.testsupport.SecureWebMvc;
 import com.samosajunction.user.dto.UserResponse;
@@ -14,6 +17,7 @@ import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.autoconfigure.web.servlet.WebMvcTest;
 import org.springframework.http.MediaType;
+import org.springframework.security.authentication.AuthenticationManager;
 import org.springframework.test.context.bean.override.mockito.MockitoBean;
 import org.springframework.test.web.servlet.MockMvc;
 
@@ -43,6 +47,18 @@ class AuthWebMvcTest {
     @MockitoBean
     private UserRepository userRepository;
 
+    @MockitoBean
+    private AuthenticationManager authenticationManager;
+
+    @MockitoBean
+    private LoginRateLimiter loginRateLimiter;
+
+    @MockitoBean
+    private RefreshTokenService refreshTokenService;
+
+    @MockitoBean
+    private SecurityAuditLogger securityAuditLogger;
+
     @Test
     void registerRejectsShortPassword() throws Exception {
         mockMvc.perform(post("/api/auth/register")
@@ -56,7 +72,7 @@ class AuthWebMvcTest {
 
     @Test
     void loginMapsBadCredentialsTo401() throws Exception {
-        when(authService.login(any())).thenThrow(new UnauthorizedException("Invalid email or password"));
+        when(authService.login(any(), any())).thenThrow(new UnauthorizedException("Invalid email or password"));
 
         mockMvc.perform(post("/api/auth/login")
                         .contentType(MediaType.APPLICATION_JSON)
@@ -73,7 +89,9 @@ class AuthWebMvcTest {
         when(authService.register(any())).thenReturn(new AuthResponse(
                 "jwt",
                 "Bearer",
-                3600,
+                900,
+                "refresh",
+                604800,
                 new UserResponse(
                         UUID.randomUUID(),
                         "ada@samosa.test",
@@ -97,6 +115,7 @@ class AuthWebMvcTest {
                                 """))
                 .andExpect(status().isCreated())
                 .andExpect(jsonPath("$.accessToken").value("jwt"))
+                .andExpect(jsonPath("$.refreshToken").value("refresh"))
                 .andExpect(jsonPath("$.tokenType").value("Bearer"));
     }
 
@@ -125,5 +144,38 @@ class AuthWebMvcTest {
                                 """))
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.message").value("Password updated. You can log in with the new password."));
+    }
+
+    @Test
+    void refreshIsPublic() throws Exception {
+        when(authService.refresh(any())).thenReturn(new AuthResponse(
+                "new-jwt",
+                "Bearer",
+                900,
+                "new-refresh",
+                604800,
+                new UserResponse(
+                        UUID.randomUUID(),
+                        "ada@samosa.test",
+                        "Ada",
+                        null,
+                        null,
+                        null,
+                        null,
+                        null,
+                        null,
+                        false,
+                        Set.of("CUSTOMER"),
+                        Instant.now()
+                )
+        ));
+
+        mockMvc.perform(post("/api/auth/refresh")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"refreshToken":"abc"}
+                                """))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.accessToken").value("new-jwt"));
     }
 }

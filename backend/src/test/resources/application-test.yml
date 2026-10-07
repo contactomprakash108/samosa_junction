@@ -7,3 +7,16 @@ samosa:
     signing-key: test-object-signing-key-32-bytes!!
   outbox:
     poller-enabled: false
+  jwt:
+    secret: test-jwt-secret-at-least-32-bytes!!
+    expiration: 15m
+    issuer: samosa-junction-test
+    audience: samosa-junction-api-test
+    clock-skew: 60s
+  auth:
+    reset-token-ttl: 30m
+    expose-reset-path: true
+    public-app-url: http://localhost:5173
+    refresh-token-ttl: 7d
+    max-login-attempts: 10
+    login-lockout-duration: 15m

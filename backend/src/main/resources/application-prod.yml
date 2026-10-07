@@ -1,0 +1,11 @@
+# AI-ASSISTED: Cursor
+# PROMPT: Production security profile with stricter auth defaults
+# ACCEPTED-BY: omprakash
+management:
+  endpoint:
+    health:
+      show-details: when_authorized
+
+samosa:
+  auth:
+    expose-reset-path: false

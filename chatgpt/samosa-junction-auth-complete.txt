@@ -1,0 +1,4054 @@
+================================================================================
+SAMOSA JUNCTION — COMPLETE AUTHENTICATION & AUTHORIZATION CODE PACK
+================================================================================
+Project: Samosa Junction (Java 21 + Spring Boot 3.5 + React/Vite frontend)
+Purpose: Paste this file into ChatGPT (or any AI) and ask it to TEACH you
+         Spring Security concepts using this real codebase.
+
+Suggested prompts to paste AFTER this file:
+--------------------------------------------------------------------------------
+1. "Walk me through the login flow step by step using this code. Explain
+    AuthenticationManager, UserDetailsService, and SecurityContext at runtime."
+
+2. "Explain how JWT access tokens and refresh tokens work in this project.
+    Why are roles NOT in the JWT?"
+
+3. "Quiz me on 401 vs 403, hasRole vs hasAuthority, and CSRF with Bearer tokens."
+
+4. "Draw the SecurityFilterChain order and explain what each filter does."
+
+5. "What would I say in a backend interview about this auth architecture?"
+
+Key concepts covered in this codebase:
+- AuthenticationManager + DaoAuthenticationProvider + UserDetailsService
+- JWT access tokens (HS256, iss/aud, 15min TTL)
+- Opaque refresh tokens (SHA-256 hash in DB, rotation, reuse detection)
+- SecurityFilterChain, JwtAuthenticationFilter, SecurityContext
+- UserPrincipal / UserDetails / ROLE_* authorities
+- BCrypt password hashing
+- Password reset (hashed tokens, no real SMTP in dev)
+- Login rate limiting (Redis)
+- CORS, CSRF (disabled for Bearer), security headers
+- Method security (@PreAuthorize)
+- 401 vs 403 error handling
+
+Stack: Spring Boot 3.5.5, Spring Security 6, jjwt 0.12.6, PostgreSQL, Redis
+================================================================================
+
+
+================================================================================
+SECTION: DOCUMENTATION
+FILE: backend/SECURITY.md
+================================================================================
+
+# Samosa Junction — Security Architecture
+
+<!-- AI-ASSISTED: Cursor -->
+<!-- PROMPT: Document production-grade Spring Security architecture -->
+<!-- ACCEPTED-BY: omprakash -->
+
+This document describes authentication, authorization, and security decisions for the backend API.
+
+## Overview
+
+The API is **stateless**. Clients authenticate with a **short-lived JWT access token** (`Authorization: Bearer …`) and renew sessions using an **opaque refresh token** stored server-side as a SHA-256 hash.
+
+Spring Security concepts in use:
+
+| Concept | Implementation |
+|---------|----------------|
+| `SecurityFilterChain` | `SecurityConfig` — URL rules, CORS, headers, CSRF policy |
+| `JwtAuthenticationFilter` | Bearer JWT → `SecurityContext` |
+| `AuthenticationManager` | Password login via `AuthService` |
+| `AuthenticationProvider` | `DaoAuthenticationProvider` |
+| `UserDetailsService` | `SamosaUserDetailsService` |
+| `UserDetails` | `UserPrincipal` |
+| `PasswordEncoder` | `BCryptPasswordEncoder` |
+| `@PreAuthorize` | Staff/kitchen controllers (defense-in-depth) |
+
+---
+
+## 1. Login Flow
+
+```mermaid
+sequenceDiagram
+    participant Client
+    participant AuthController
+    participant AuthService
+    participant LoginRateLimiter
+    participant AuthenticationManager
+    participant DaoAuthenticationProvider
+    participant SamosaUserDetailsService
+    participant PasswordEncoder
+    participant JwtService
+    participant RefreshTokenService
+
+    Client->>AuthController: POST /api/auth/login
+    AuthController->>AuthService: login(request, clientIp)
+    AuthService->>LoginRateLimiter: checkAllowed(ip, email)
+    AuthService->>AuthenticationManager: authenticate(email, password)
+    AuthenticationManager->>DaoAuthenticationProvider: authenticate
+    DaoAuthenticationProvider->>SamosaUserDetailsService: loadUserByUsername(email)
+    DaoAuthenticationProvider->>PasswordEncoder: matches(raw, hash)
+    AuthService->>JwtService: createAccessToken(userId)
+    AuthService->>RefreshTokenService: issueForUser(userId)
+    AuthService-->>Client: accessToken + refreshToken + user
+```
+
+**Why `AuthenticationManager`?** Login delegates credential verification to Spring Security's standard pipeline. `UserDetailsService` loads the user; `PasswordEncoder` verifies the hash; disabled accounts throw `DisabledException`. `AuthService` remains the orchestration layer and maps failures to a generic `"Invalid email or password"` message.
+
+---
+
+## 2. Registration Flow
+
+`POST /api/auth/register` — public.
+
+1. Normalize email, reject duplicates.
+2. Hash password with BCrypt.
+3. Assign `CUSTOMER` role, create wallet.
+4. Issue access + refresh tokens (same response shape as login).
+
+---
+
+## 3. JWT Access Tokens
+
+**Algorithm:** HS256 (HMAC-SHA256) via jjwt 0.12.6  
+**Secret:** `JWT_SECRET` env var (minimum 32 bytes). Production startup fails if the dev default is used (`spring.profiles.active=prod`).
+
+| Claim | Purpose |
+|-------|---------|
+| `sub` | User UUID — sole identity claim |
+| `iss` | Issuer — validated on parse (`JWT_ISSUER`) |
+| `aud` | Audience — validated on parse (`JWT_AUDIENCE`) |
+| `iat` / `exp` | Lifetime — default **15 minutes** (`JWT_EXPIRATION`) |
+
+**Excluded from JWT:** roles, email, passwords, PII. Roles are loaded from the database on each request so role changes take effect immediately.
+
+**Clock skew:** 60 seconds (`JWT_CLOCK_SKEW`) tolerates minor clock drift between services.
+
+---
+
+## 4. JWT Validation (Filter)
+
+`JwtAuthenticationFilter` runs before `UsernamePasswordAuthenticationFilter`:
+
+1. Read `Authorization` header; require `Bearer` scheme.
+2. Parse and validate JWT via `JwtService` (signature, iss, aud, exp).
+3. Load user + roles from DB; reject disabled users.
+4. Build `UserPrincipal.forAuthenticatedUser(user)` — **no password hash** in context.
+5. Set `Authentication` on `SecurityContextHolder`.
+6. Invalid tokens: clear context, continue chain (protected endpoints → 401).
+
+---
+
+## 5. Refresh Tokens
+
+**Design:** Opaque random tokens (256-bit), **never stored raw**. Only SHA-256 hashes persist in `refresh_tokens`.
+
+| Field | Purpose |
+|-------|---------|
+| `token_hash` | SHA-256 of raw token (unique) |
+| `expires_at` | Default 7 days (`AUTH_REFRESH_TOKEN_TTL`) |
+| `revoked_at` | Logout, rotation, or reuse detection |
+| `replaced_by_token_id` | Links rotated token chain |
+
+**Endpoints:**
+
+- `POST /api/auth/refresh` — rotate refresh token, issue new access token.
+- `POST /api/auth/logout` — revoke presented refresh token.
+
+**Rotation:** Each refresh invalidates the old token and issues a new one.
+
+**Reuse detection:** Presenting an already-revoked refresh token revokes **all** active refresh tokens for that user (stolen-token scenario).
+
+**Revocation triggers:** logout, password reset, reuse detection.
+
+---
+
+## 6. Roles vs Authorities
+
+| DB Role | Spring Authority | `hasRole("X")` | `hasAuthority("X")` |
+|---------|------------------|----------------|---------------------|
+| `ADMIN` | `ROLE_ADMIN` | `hasRole("ADMIN")` | `hasAuthority("ROLE_ADMIN")` |
+| `STAFF` | `ROLE_STAFF` | `hasRole("STAFF")` | `hasAuthority("ROLE_STAFF")` |
+| `CUSTOMER` | `ROLE_CUSTOMER` | `hasRole("CUSTOMER")` | `hasAuthority("ROLE_CUSTOMER")` |
+
+`hasRole("ADMIN")` automatically prefixes `ROLE_`. Authorities come from the database only — never from client input.
+
+---
+
+## 7. Authorization
+
+**Layer 1 — URL matchers (`SecurityConfig`):**
+
+| Access | Examples |
+|--------|----------|
+| Public | `/api/auth/*`, catalog GET, `/actuator/health` |
+| STAFF/ADMIN | product mutations, inventory PUT, complaint PATCH, `/api/staff/**` |
+| Authenticated | orders, cart, wallet, profile |
+
+**Layer 2 — `@PreAuthorize`:** `StaffController`, `KitchenController`.
+
+**Layer 3 — Service ownership:** orders, payments, complaints verify `userId` or `isPrivileged()`.
+
+---
+
+## 8. 401 vs 403
+
+| Status | Meaning | Handler |
+|--------|---------|---------|
+| **401** | Missing/invalid authentication | `JsonAuthenticationEntryPoint` |
+| **403** | Authenticated but not authorized | `JsonAccessDeniedHandler` |
+
+Errors use `ApiError` JSON — no stack traces, JWT internals, or credential details.
+
+---
+
+## 9. Password Reset
+
+1. `POST /api/auth/forgot-password` — generic response (no email enumeration).
+2. Invalidates prior active reset tokens for the user.
+3. Opaque token emailed; SHA-256 hash stored; 30-minute TTL.
+4. `POST /api/auth/reset-password` — single-use; revokes all refresh tokens.
+
+Production: `AUTH_EXPOSE_RESET_PATH=false` (no reset URL in API response).
+
+---
+
+## 10. Account Security
+
+**Login rate limiting (Redis):** Tracks failures per IP and per email. Default: 10 attempts / 15-minute lockout (`AUTH_MAX_LOGIN_ATTEMPTS`, `AUTH_LOGIN_LOCKOUT_DURATION`).
+
+**Audit logging:** Structured logs for login success/failure, password reset, refresh rotation, reuse detection, rate limiting. Never logs passwords, tokens, or Authorization headers.
+
+---
+
+## 11. CORS
+
+Configured origins from `CORS_ALLOWED_ORIGINS` — never `*` with credentials. Applies to `/api/**` only.
+
+**CORS is not authentication.** It controls browser cross-origin access only; the API still requires JWT for protected resources.
+
+---
+
+## 12. CSRF
+
+**Disabled** — correct for Bearer-token APIs. Browsers do not automatically attach `Authorization` headers on cross-origin requests.
+
+**Revisit if:** refresh tokens move to `HttpOnly` cookies → enable CSRF + `SameSite=Strict`.
+
+---
+
+## 13. Security Headers
+
+Enabled in `SecurityConfig`:
+
+- `X-Content-Type-Options: nosniff`
+- `X-Frame-Options: DENY`
+- `Referrer-Policy: strict-origin-when-cross-origin`
+- `Strict-Transport-Security` (on HTTPS connections)
+
+---
+
+## 14. Secret Management
+
+| Secret | Source |
+|--------|--------|
+| `JWT_SECRET` | Environment / secret manager |
+| `DB_PASSWORD` | Environment |
+| `JWT_ISSUER`, `JWT_AUDIENCE` | Environment (non-secret but configurable) |
+
+Never commit production secrets. Dev defaults exist for local/docker only.
+
+**Production profile:** `spring.profiles.active=prod` enables stricter defaults and blocks the dev JWT secret.
+
+---
+
+## 15. Configuration Reference
+
+```yaml
+samosa:
+  jwt:
+    secret: ${JWT_SECRET}           # required in prod, ≥32 bytes
+    expiration: ${JWT_EXPIRATION:15m}
+    issuer: ${JWT_ISSUER:samosa-junction}
+    audience: ${JWT_AUDIENCE:samosa-junction-api}
+    clock-skew: ${JWT_CLOCK_SKEW:60s}
+  auth:
+    refresh-token-ttl: ${AUTH_REFRESH_TOKEN_TTL:7d}
+    max-login-attempts: ${AUTH_MAX_LOGIN_ATTEMPTS:10}
+    login-lockout-duration: ${AUTH_LOGIN_LOCKOUT_DURATION:15m}
+    expose-reset-path: ${AUTH_EXPOSE_RESET_PATH:true}  # false in prod
+```
+
+---
+
+## 16. Interview Summary
+
+> "We use stateless JWT access tokens for API authentication, but refresh tokens are opaque and stored as hashes so we can revoke sessions. Login goes through Spring Security's `AuthenticationManager` so credential checks use the standard `UserDetailsService` + `PasswordEncoder` pipeline. Roles live in the database, not the JWT, so authorization changes are immediate. CSRF is off because we use Bearer tokens, not cookies. Defense-in-depth: URL rules, method security, and service-layer ownership checks."
+
+================================================================================
+SECTION: DOCUMENTATION
+FILE: docs/authentication.md
+================================================================================
+
+# Authentication
+
+## Problem
+
+Public HTTP APIs cannot trust the caller. We need to know *who* the user is (authentication) and *what they are allowed to do* (authorization) without storing server-side sessions.
+
+## Flow
+
+```mermaid
+sequenceDiagram
+    participant Client
+    participant AuthController
+    participant AuthService
+    participant BCrypt
+    participant PostgreSQL
+    participant JwtService
+
+    Client->>AuthController: POST /api/auth/register
+    AuthController->>AuthService: register(dto)
+    AuthService->>PostgreSQL: email unique?
+    AuthService->>BCrypt: hash password
+    AuthService->>PostgreSQL: insert user + CUSTOMER role
+    AuthService->>JwtService: sign HS256 JWT
+    JwtService-->>Client: accessToken + user
+```
+
+Login is the same except we `matches()` the hash instead of inserting a row.
+
+Authenticated calls:
+
+```text
+Authorization: Bearer <jwt>
+        ↓
+JwtAuthenticationFilter  (parse + signature + expiry)
+        ↓
+Load User by id (enabled? roles?)
+        ↓
+SecurityContext  (UserPrincipal)
+        ↓
+Controller  (@AuthenticationPrincipal)
+```
+
+Java remains the source of truth. The token is a signed claim that the user logged in; disabling the account in PostgreSQL still blocks the next request because the filter reloads the user.
+
+## Why JWT (stateless)
+
+The API does not keep a session in Redis/memory. Any instance can verify the signature with the same secret. That matches a future ECS/EC2 horizontal scale-out.
+
+Trade-off: you cannot instantly revoke a token unless you add a denylist or short TTL. We mitigate by loading `enabled` from the database on each request. We are **not** claiming a full token-revocation system yet.
+
+## Why BCrypt
+
+Passwords must never be stored in plaintext. BCrypt is a slow, salted one-way hash. Even if the `users` table leaks, an attacker still has to brute-force hashes. BCrypt only uses the first 72 bytes of the password — that is why registration caps length at 72.
+
+## SecurityFilterChain
+
+- CSRF is disabled: browsers send cookies automatically (CSRF target). We use `Authorization` headers, not cookie sessions.
+- Session policy is `STATELESS`.
+- `POST /api/auth/register` and `/login` are public.
+- `/actuator/health` and `/info` are public so local/load-balancer checks work. Tighten this before production.
+- Everything else requires authentication.
+
+Roles are stored as `ROLE_CUSTOMER`, `ROLE_STAFF`, `ROLE_ADMIN` so `@PreAuthorize("hasRole('ADMIN')")` works later. No admin-only APIs exist yet.
+
+## ID strategy (users)
+
+`users.id` is a UUID generated by Hibernate. We do **not** expose auto-increment user ids in JWTs, so a client cannot guess the next user.
+
+| | UUID | BIGINT identity |
+| --- | --- | --- |
+| Guessable | No | Yes (enumerable) |
+| Index size | Larger | Smaller |
+| Sort by insert time | Random UUID is not ordered | Natural |
+| DB joins | Slightly heavier | Cheaper |
+
+Roles use `BIGSERIAL` because there are three rows and they are not public identifiers.
+
+## What we did not build yet
+
+Refresh tokens, email verification, OAuth2, a **full address book**, or login rate limiting.
+
+**Password reset is live** (`POST /api/auth/forgot-password` and `reset-password`). Locally the JSON may include `resetPath` because there is **no SMTP**. That is demo-only.
+
+## Next kitchen: real email / SMS
+
+Send the reset link by email (or OTP by SMS). Never return `resetPath` or the raw token in production JSON. Store hashed tokens (already the direction in `password_reset_tokens`). Add login rate limiting when brute-force is a real concern.
+
+Profile holds **one** default delivery + phone (`PATCH /api/users/me`). Multiple saved homes is leftover — see [learning.md](learning.md).
+
+================================================================================
+SECTION: CONFIG
+FILE: backend/src/main/resources/application.yml
+================================================================================
+
+spring:
+  application:
+    name: samosa-junction
+  servlet:
+    multipart:
+      max-file-size: 5MB
+      max-request-size: 5MB
+  datasource:
+    url: jdbc:postgresql://${DB_HOST:localhost}:${DB_PORT:5432}/${DB_NAME:samosa_junction}
+    username: ${DB_USERNAME:samosa}
+    password: ${DB_PASSWORD:samosa}
+  flyway:
+    enabled: true
+    placeholder-replacement: false
+  data:
+    web:
+      pageable:
+        default-page-size: 20
+        max-page-size: 100
+    redis:
+      host: ${REDIS_HOST:localhost}
+      port: ${REDIS_PORT:6379}
+  jpa:
+    open-in-view: false
+    hibernate:
+      ddl-auto: none
+    properties:
+      hibernate:
+        jdbc:
+          time_zone: UTC
+  jackson:
+    serialization:
+      write-dates-as-timestamps: false
+
+server:
+  port: ${SERVER_PORT:8080}
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info
+  endpoint:
+    health:
+      show-details: always
+  info:
+    env:
+      enabled: true
+
+info:
+  app:
+    name: Samosa Junction
+    phase: 14-recommendations
+    description: Modular monolith food-ordering backend
+
+samosa:
+  assistant:
+    open-router-api-key: ${OPENROUTER_API_KEY:}
+    base-url: ${OPENROUTER_BASE_URL:https://openrouter.ai/api/v1}
+    chat-model: ${OPENROUTER_CHAT_MODEL:openai/gpt-4o-mini}
+    embedding-model: ${OPENROUTER_EMBEDDING_MODEL:openai/text-embedding-3-small}
+    max-tool-rounds: ${ASSISTANT_MAX_TOOL_ROUNDS:6}
+    semantic-top-k: ${ASSISTANT_SEMANTIC_TOP_K:5}
+  # AI-ASSISTED: Cursor | PROMPT: Add refresh token and login rate-limit settings | ACCEPTED-BY: omprakash
+  auth:
+    reset-token-ttl: ${AUTH_RESET_TOKEN_TTL:30m}
+    expose-reset-path: ${AUTH_EXPOSE_RESET_PATH:true}
+    public-app-url: ${AUTH_PUBLIC_APP_URL:http://localhost:5173}
+    refresh-token-ttl: ${AUTH_REFRESH_TOKEN_TTL:7d}
+    max-login-attempts: ${AUTH_MAX_LOGIN_ATTEMPTS:10}
+    login-lockout-duration: ${AUTH_LOGIN_LOCKOUT_DURATION:15m}
+  outbox:
+    poll-ms: ${OUTBOX_POLL_MS:5000}
+    poller-enabled: ${OUTBOX_POLLER_ENABLED:true}
+  # AI-ASSISTED: Cursor | PROMPT: Harden JWT with iss/aud/clock-skew and shorter TTL | ACCEPTED-BY: omprakash
+  jwt:
+    secret: ${JWT_SECRET:local-dev-only-change-me-32bytes-min-key!}
+    expiration: ${JWT_EXPIRATION:15m}
+    issuer: ${JWT_ISSUER:samosa-junction}
+    audience: ${JWT_AUDIENCE:samosa-junction-api}
+    clock-skew: ${JWT_CLOCK_SKEW:60s}
+  cors:
+    allowed-origins: ${CORS_ALLOWED_ORIGINS:http://localhost:5173,http://localhost:3000}
+  cart:
+    ttl: ${CART_TTL:7d}
+    max-quantity: ${CART_MAX_QUANTITY:20}
+    redis-key-prefix: "cart:user:"
+  kafka:
+    enabled: ${KAFKA_ENABLED:false}
+    bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS:localhost:9092}
+    topic: ${KAFKA_TOPIC:samosa.domain-events}
+  s3:
+    enabled: ${S3_ENABLED:false}
+    endpoint: ${S3_ENDPOINT:}
+    presign-endpoint: ${S3_PRESIGN_ENDPOINT:}
+    region: ${S3_REGION:us-east-1}
+    bucket: ${S3_BUCKET:samosa-junction}
+    access-key: ${S3_ACCESS_KEY:}
+    secret-key: ${S3_SECRET_KEY:}
+    path-style: ${S3_PATH_STYLE:true}
+    presign-ttl: ${S3_PRESIGN_TTL:15m}
+    max-file-bytes: ${S3_MAX_FILE_BYTES:5000000}
+    max-complaint-images: ${S3_MAX_COMPLAINT_IMAGES:5}
+    local-root: ${S3_LOCAL_ROOT:data/object-storage}
+    public-base-url: ${S3_PUBLIC_BASE_URL:http://localhost:8080}
+    signing-key: ${S3_SIGNING_KEY:local-dev-object-signing-key-32b!}
+
+================================================================================
+SECTION: CONFIG
+FILE: backend/src/main/resources/application-prod.yml
+================================================================================
+
+# AI-ASSISTED: Cursor
+# PROMPT: Production security profile with stricter auth defaults
+# ACCEPTED-BY: omprakash
+management:
+  endpoint:
+    health:
+      show-details: when_authorized
+
+samosa:
+  auth:
+    expose-reset-path: false
+
+================================================================================
+SECTION: DATABASE
+FILE: backend/src/main/resources/db/migration/V1__create_users_and_roles.sql
+================================================================================
+
+CREATE TABLE roles (
+    id   BIGSERIAL PRIMARY KEY,
+    name VARCHAR(32) NOT NULL,
+    CONSTRAINT uk_roles_name UNIQUE (name)
+);
+
+CREATE TABLE users (
+    id            UUID PRIMARY KEY,
+    email         VARCHAR(320) NOT NULL,
+    password_hash VARCHAR(255) NOT NULL,
+    full_name     VARCHAR(120) NOT NULL,
+    enabled       BOOLEAN      NOT NULL DEFAULT TRUE,
+    created_at    TIMESTAMPTZ  NOT NULL,
+    updated_at    TIMESTAMPTZ  NOT NULL,
+    CONSTRAINT uk_users_email UNIQUE (email)
+);
+
+CREATE TABLE user_roles (
+    user_id UUID   NOT NULL REFERENCES users (id),
+    role_id BIGINT NOT NULL REFERENCES roles (id),
+    CONSTRAINT pk_user_roles PRIMARY KEY (user_id, role_id)
+);
+
+CREATE INDEX idx_user_roles_role_id ON user_roles (role_id);
+
+INSERT INTO roles (name) VALUES ('CUSTOMER'), ('STAFF'), ('ADMIN');
+
+================================================================================
+SECTION: DATABASE
+FILE: backend/src/main/resources/db/migration/V12__create_password_reset_tokens.sql
+================================================================================
+
+
+CREATE TABLE password_reset_tokens (
+    id         UUID PRIMARY KEY,
+    user_id    UUID         NOT NULL REFERENCES users (id),
+    token_hash VARCHAR(64)  NOT NULL,
+    expires_at TIMESTAMPTZ  NOT NULL,
+    used_at    TIMESTAMPTZ,
+    created_at TIMESTAMPTZ  NOT NULL,
+    CONSTRAINT uk_password_reset_tokens_hash UNIQUE (token_hash)
+);
+
+CREATE INDEX idx_password_reset_tokens_user ON password_reset_tokens (user_id);
+
+================================================================================
+SECTION: DATABASE
+FILE: backend/src/main/resources/db/migration/V16__create_refresh_tokens.sql
+================================================================================
+
+CREATE TABLE refresh_tokens (
+    id                    UUID PRIMARY KEY,
+    user_id               UUID         NOT NULL REFERENCES users (id),
+    token_hash            VARCHAR(64)  NOT NULL,
+    expires_at            TIMESTAMPTZ  NOT NULL,
+    created_at            TIMESTAMPTZ  NOT NULL,
+    revoked_at            TIMESTAMPTZ,
+    replaced_by_token_id  UUID         REFERENCES refresh_tokens (id),
+    CONSTRAINT uk_refresh_tokens_hash UNIQUE (token_hash)
+);
+
+CREATE INDEX idx_refresh_tokens_user ON refresh_tokens (user_id);
+CREATE INDEX idx_refresh_tokens_expires ON refresh_tokens (expires_at);
+
+================================================================================
+SECTION: BACKEND - USER
+FILE: backend/src/main/java/com/samosajunction/user/entity/User.java
+================================================================================
+
+package com.samosajunction.user.entity;
+
+
+import jakarta.persistence.Column;
+import jakarta.persistence.Entity;
+import jakarta.persistence.EntityListeners;
+import jakarta.persistence.FetchType;
+import jakarta.persistence.GeneratedValue;
+import jakarta.persistence.GenerationType;
+import jakarta.persistence.Id;
+import jakarta.persistence.JoinColumn;
+import jakarta.persistence.JoinTable;
+import jakarta.persistence.ManyToMany;
+import jakarta.persistence.Table;
+import org.springframework.data.annotation.CreatedDate;
+import org.springframework.data.annotation.LastModifiedDate;
+import org.springframework.data.jpa.domain.support.AuditingEntityListener;
+
+import java.time.Instant;
+import java.util.HashSet;
+import java.util.Set;
+import java.util.UUID;
+
+@Entity
+@Table(name = "users")
+@EntityListeners(AuditingEntityListener.class)
+public class User {
+
+    @Id
+    @GeneratedValue(strategy = GenerationType.UUID)
+    private UUID id;
+
+    @Column(nullable = false, unique = true, length = 320)
+    private String email;
+
+    @Column(name = "password_hash", nullable = false)
+    private String passwordHash;
+
+    @Column(name = "full_name", nullable = false, length = 120)
+    private String fullName;
+
+    @Column(length = 20)
+    private String phone;
+
+    @Column(name = "recipient_name", length = 120)
+    private String recipientName;
+
+    @Column(name = "address_line1", length = 200)
+    private String addressLine1;
+
+    @Column(length = 80)
+    private String city;
+
+    @Column(length = 80)
+    private String state;
+
+    @Column(length = 16)
+    private String pincode;
+
+    @Column(nullable = false)
+    private boolean enabled = true;
+
+    @CreatedDate
+    @Column(name = "created_at", nullable = false, updatable = false)
+    private Instant createdAt;
+
+    @LastModifiedDate
+    @Column(name = "updated_at", nullable = false)
+    private Instant updatedAt;
+
+    @ManyToMany(fetch = FetchType.LAZY)
+    @JoinTable(
+            name = "user_roles",
+            joinColumns = @JoinColumn(name = "user_id"),
+            inverseJoinColumns = @JoinColumn(name = "role_id")
+    )
+    private Set<Role> roles = new HashSet<>();
+
+    protected User() {
+    }
+
+    public User(String email, String passwordHash, String fullName) {
+        this.email = email;
+        this.passwordHash = passwordHash;
+        this.fullName = fullName;
+        this.enabled = true;
+    }
+
+    public void addRole(Role role) {
+        this.roles.add(role);
+    }
+
+    public void setPasswordHash(String passwordHash) {
+        this.passwordHash = passwordHash;
+    }
+
+    public UUID getId() {
+        return id;
+    }
+
+    public String getEmail() {
+        return email;
+    }
+
+    public String getPasswordHash() {
+        return passwordHash;
+    }
+
+    public String getFullName() {
+        return fullName;
+    }
+
+    public String getPhone() {
+        return phone;
+    }
+
+    public String getRecipientName() {
+        return recipientName;
+    }
+
+    public String getAddressLine1() {
+        return addressLine1;
+    }
+
+    public String getCity() {
+        return city;
+    }
+
+    public String getState() {
+        return state;
+    }
+
+    public String getPincode() {
+        return pincode;
+    }
+
+    public boolean hasDefaultAddress() {
+        return notBlank(recipientName)
+                && notBlank(addressLine1)
+                && notBlank(city)
+                && notBlank(state)
+                && notBlank(pincode);
+    }
+
+    public void updateProfile(
+            String fullName,
+            String phone,
+            String recipientName,
+            String addressLine1,
+            String city,
+            String state,
+            String pincode
+    ) {
+        if (notBlank(fullName)) {
+            this.fullName = fullName.trim();
+        }
+        this.phone = blankToNull(phone);
+        this.recipientName = blankToNull(recipientName);
+        this.addressLine1 = blankToNull(addressLine1);
+        this.city = blankToNull(city);
+        this.state = blankToNull(state);
+        this.pincode = blankToNull(pincode);
+    }
+
+    public void replaceDefaultAddress(
+            String recipientName,
+            String addressLine1,
+            String city,
+            String state,
+            String pincode
+    ) {
+        this.recipientName = blankToNull(recipientName);
+        this.addressLine1 = blankToNull(addressLine1);
+        this.city = blankToNull(city);
+        this.state = blankToNull(state);
+        this.pincode = blankToNull(pincode);
+    }
+
+    private static boolean notBlank(String value) {
+        return value != null && !value.isBlank();
+    }
+
+    private static String blankToNull(String value) {
+        if (value == null || value.isBlank()) {
+            return null;
+        }
+        return value.trim();
+    }
+
+    public boolean isEnabled() {
+        return enabled;
+    }
+
+    public Instant getCreatedAt() {
+        return createdAt;
+    }
+
+    public Instant getUpdatedAt() {
+        return updatedAt;
+    }
+
+    public Set<Role> getRoles() {
+        return roles;
+    }
+}
+
+================================================================================
+SECTION: BACKEND - USER
+FILE: backend/src/main/java/com/samosajunction/user/entity/Role.java
+================================================================================
+
+package com.samosajunction.user.entity;
+
+import jakarta.persistence.Column;
+import jakarta.persistence.Entity;
+import jakarta.persistence.EnumType;
+import jakarta.persistence.Enumerated;
+import jakarta.persistence.GeneratedValue;
+import jakarta.persistence.GenerationType;
+import jakarta.persistence.Id;
+import jakarta.persistence.Table;
+
+@Entity
+@Table(name = "roles")
+public class Role {
+
+    @Id
+    @GeneratedValue(strategy = GenerationType.IDENTITY)
+    private Long id;
+
+    @Enumerated(EnumType.STRING)
+    @Column(nullable = false, unique = true, length = 32)
+    private RoleName name;
+
+    protected Role() {
+    }
+
+    public Role(RoleName name) {
+        this.name = name;
+    }
+
+    public Long getId() {
+        return id;
+    }
+
+    public RoleName getName() {
+        return name;
+    }
+}
+
+================================================================================
+SECTION: BACKEND - USER
+FILE: backend/src/main/java/com/samosajunction/user/entity/RoleName.java
+================================================================================
+
+package com.samosajunction.user.entity;
+
+public enum RoleName {
+    CUSTOMER,
+    STAFF,
+    ADMIN
+}
+
+================================================================================
+SECTION: BACKEND - USER
+FILE: backend/src/main/java/com/samosajunction/user/repository/UserRepository.java
+================================================================================
+
+package com.samosajunction.user.repository;
+
+import com.samosajunction.user.entity.User;
+import org.springframework.data.jpa.repository.EntityGraph;
+import org.springframework.data.jpa.repository.JpaRepository;
+
+import java.util.Optional;
+import java.util.UUID;
+
+public interface UserRepository extends JpaRepository<User, UUID> {
+
+    boolean existsByEmailIgnoreCase(String email);
+
+    @EntityGraph(attributePaths = "roles")
+    Optional<User> findByEmailIgnoreCase(String email);
+
+    @EntityGraph(attributePaths = "roles")
+    Optional<User> findWithRolesById(UUID id);
+}
+
+================================================================================
+SECTION: BACKEND - USER
+FILE: backend/src/main/java/com/samosajunction/user/dto/UserResponse.java
+================================================================================
+
+package com.samosajunction.user.dto;
+
+import com.samosajunction.user.entity.User;
+
+import java.time.Instant;
+import java.util.Set;
+import java.util.UUID;
+import java.util.stream.Collectors;
+
+public record UserResponse(
+        UUID id,
+        String email,
+        String fullName,
+        String phone,
+        String recipientName,
+        String addressLine1,
+        String city,
+        String state,
+        String pincode,
+        boolean hasDefaultAddress,
+        Set<String> roles,
+        Instant createdAt
+) {
+    public static UserResponse from(User user) {
+        return new UserResponse(
+                user.getId(),
+                user.getEmail(),
+                user.getFullName(),
+                user.getPhone(),
+                user.getRecipientName(),
+                user.getAddressLine1(),
+                user.getCity(),
+                user.getState(),
+                user.getPincode(),
+                user.hasDefaultAddress(),
+                user.getRoles().stream()
+                        .map(role -> role.getName().name())
+                        .collect(Collectors.toUnmodifiableSet()),
+                user.getCreatedAt()
+        );
+    }
+}
+
+================================================================================
+SECTION: BACKEND - AUTH
+FILE: backend/src/main/java/com/samosajunction/auth/controller/AuthController.java
+================================================================================
+
+package com.samosajunction.auth.controller;
+
+import com.samosajunction.auth.dto.AuthResponse;
+import com.samosajunction.auth.dto.ForgotPasswordRequest;
+import com.samosajunction.auth.dto.ForgotPasswordResponse;
+import com.samosajunction.auth.dto.LoginRequest;
+import com.samosajunction.auth.dto.LogoutRequest;
+import com.samosajunction.auth.dto.MessageResponse;
+import com.samosajunction.auth.dto.RefreshTokenRequest;
+import com.samosajunction.auth.dto.RegisterRequest;
+import com.samosajunction.auth.dto.ResetPasswordRequest;
+import com.samosajunction.auth.service.AuthService;
+import com.samosajunction.auth.support.ClientIpResolver;
+import jakarta.servlet.http.HttpServletRequest;
+import jakarta.validation.Valid;
+import org.springframework.http.HttpStatus;
+import org.springframework.web.bind.annotation.PostMapping;
+import org.springframework.web.bind.annotation.RequestBody;
+import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.ResponseStatus;
+import org.springframework.web.bind.annotation.RestController;
+
+// AI-ASSISTED: Cursor
+// PROMPT: Add refresh and logout endpoints with client IP for login rate limiting
+// ACCEPTED-BY: omprakash
+@RestController
+@RequestMapping("/api/auth")
+public class AuthController {
+
+    private final AuthService authService;
+
+    public AuthController(AuthService authService) {
+        this.authService = authService;
+    }
+
+    @PostMapping("/register")
+    @ResponseStatus(HttpStatus.CREATED)
+    public AuthResponse register(@Valid @RequestBody RegisterRequest request) {
+        return authService.register(request);
+    }
+
+    @PostMapping("/login")
+    public AuthResponse login(@Valid @RequestBody LoginRequest request, HttpServletRequest httpRequest) {
+        return authService.login(request, ClientIpResolver.resolve(httpRequest));
+    }
+
+    @PostMapping("/refresh")
+    public AuthResponse refresh(@Valid @RequestBody RefreshTokenRequest request) {
+        return authService.refresh(request);
+    }
+
+    @PostMapping("/logout")
+    public MessageResponse logout(@Valid @RequestBody LogoutRequest request) {
+        return authService.logout(request);
+    }
+
+    @PostMapping("/forgot-password")
+    public ForgotPasswordResponse forgotPassword(@Valid @RequestBody ForgotPasswordRequest request) {
+        return authService.forgotPassword(request);
+    }
+
+    @PostMapping("/reset-password")
+    public MessageResponse resetPassword(@Valid @RequestBody ResetPasswordRequest request) {
+        return authService.resetPassword(request);
+    }
+}
+
+================================================================================
+SECTION: BACKEND - AUTH
+FILE: backend/src/main/java/com/samosajunction/auth/service/AuthService.java
+================================================================================
+
+package com.samosajunction.auth.service;
+
+import com.samosajunction.auth.config.AuthProperties;
+import com.samosajunction.auth.dto.AuthResponse;
+import com.samosajunction.auth.dto.ForgotPasswordRequest;
+import com.samosajunction.auth.dto.ForgotPasswordResponse;
+import com.samosajunction.auth.dto.LoginRequest;
+import com.samosajunction.auth.dto.LogoutRequest;
+import com.samosajunction.auth.dto.MessageResponse;
+import com.samosajunction.auth.dto.RefreshTokenRequest;
+import com.samosajunction.auth.dto.RegisterRequest;
+import com.samosajunction.auth.dto.ResetPasswordRequest;
+import com.samosajunction.auth.entity.PasswordResetToken;
+import com.samosajunction.auth.repository.PasswordResetTokenRepository;
+import com.samosajunction.auth.security.JwtService;
+import com.samosajunction.auth.security.TokenHasher;
+import com.samosajunction.auth.security.UserPrincipal;
+import com.samosajunction.auth.support.SecurityAuditLogger;
+import com.samosajunction.common.exception.InvalidRequestException;
+import com.samosajunction.common.exception.ResourceConflictException;
+import com.samosajunction.common.exception.ResourceNotFoundException;
+import com.samosajunction.common.exception.UnauthorizedException;
+import com.samosajunction.notification.service.NotificationService;
+import com.samosajunction.user.dto.UserResponse;
+import com.samosajunction.user.entity.RoleName;
+import com.samosajunction.user.entity.User;
+import com.samosajunction.user.repository.RoleRepository;
+import com.samosajunction.user.repository.UserRepository;
+import com.samosajunction.wallet.service.WalletService;
+import org.springframework.security.authentication.AuthenticationManager;
+import org.springframework.security.authentication.BadCredentialsException;
+import org.springframework.security.authentication.DisabledException;
+import org.springframework.security.authentication.UsernamePasswordAuthenticationToken;
+import org.springframework.security.crypto.password.PasswordEncoder;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+
+import java.time.Instant;
+import java.util.Locale;
+import java.util.UUID;
+
+// AI-ASSISTED: Cursor
+// PROMPT: Refactor auth orchestration to AuthenticationManager and refresh tokens
+// ACCEPTED-BY: omprakash
+@Service
+public class AuthService {
+
+    private static final String INVALID_CREDENTIALS = "Invalid email or password";
+    private static final String FORGOT_MESSAGE =
+            "If an account exists for this email, a password reset link was issued.";
+
+    private final UserRepository userRepository;
+    private final RoleRepository roleRepository;
+    private final PasswordEncoder passwordEncoder;
+    private final AuthenticationManager authenticationManager;
+    private final JwtService jwtService;
+    private final WalletService walletService;
+    private final PasswordResetTokenRepository passwordResetTokenRepository;
+    private final RefreshTokenService refreshTokenService;
+    private final AuthProperties authProperties;
+    private final NotificationService notificationService;
+    private final LoginRateLimiter loginRateLimiter;
+    private final SecurityAuditLogger auditLogger;
+
+    public AuthService(
+            UserRepository userRepository,
+            RoleRepository roleRepository,
+            PasswordEncoder passwordEncoder,
+            AuthenticationManager authenticationManager,
+            JwtService jwtService,
+            WalletService walletService,
+            PasswordResetTokenRepository passwordResetTokenRepository,
+            RefreshTokenService refreshTokenService,
+            AuthProperties authProperties,
+            NotificationService notificationService,
+            LoginRateLimiter loginRateLimiter,
+            SecurityAuditLogger auditLogger
+    ) {
+        this.userRepository = userRepository;
+        this.roleRepository = roleRepository;
+        this.passwordEncoder = passwordEncoder;
+        this.authenticationManager = authenticationManager;
+        this.jwtService = jwtService;
+        this.walletService = walletService;
+        this.passwordResetTokenRepository = passwordResetTokenRepository;
+        this.refreshTokenService = refreshTokenService;
+        this.authProperties = authProperties;
+        this.notificationService = notificationService;
+        this.loginRateLimiter = loginRateLimiter;
+        this.auditLogger = auditLogger;
+    }
+
+    @Transactional
+    public AuthResponse register(RegisterRequest request) {
+        String email = normalizeEmail(request.email());
+        if (userRepository.existsByEmailIgnoreCase(email)) {
+            throw new ResourceConflictException("An account with this email already exists");
+        }
+
+        var customerRole = roleRepository.findByName(RoleName.CUSTOMER)
+                .orElseThrow(() -> new ResourceNotFoundException("CUSTOMER role is not configured"));
+
+        var user = new User(email, passwordEncoder.encode(request.password()), request.fullName().trim());
+        user.addRole(customerRole);
+        userRepository.save(user);
+        walletService.createForNewUser(user.getId());
+
+        return toAuthResponse(user);
+    }
+
+    @Transactional(readOnly = true)
+    public AuthResponse login(LoginRequest request, String clientIp) {
+        String email = normalizeEmail(request.email());
+        loginRateLimiter.checkAllowed(clientIp, email);
+
+        try {
+            var authentication = authenticationManager.authenticate(
+                    new UsernamePasswordAuthenticationToken(email, request.password())
+            );
+            var principal = (UserPrincipal) authentication.getPrincipal();
+            User user = userRepository.findWithRolesById(principal.getId())
+                    .orElseThrow(() -> new UnauthorizedException(INVALID_CREDENTIALS));
+            loginRateLimiter.recordSuccess(clientIp, email);
+            auditLogger.loginSucceeded(user.getId(), user.getEmail(), clientIp);
+            return toAuthResponse(user);
+        } catch (BadCredentialsException | DisabledException ex) {
+            loginRateLimiter.recordFailure(clientIp, email);
+            auditLogger.loginFailed(email, clientIp, "invalid_credentials");
+            throw new UnauthorizedException(INVALID_CREDENTIALS);
+        }
+    }
+
+    @Transactional
+    public AuthResponse refresh(RefreshTokenRequest request) {
+        var rotation = refreshTokenService.rotate(request.refreshToken());
+        return toAuthResponse(rotation.user(), rotation.refreshToken());
+    }
+
+    @Transactional
+    public MessageResponse logout(LogoutRequest request) {
+        refreshTokenService.revoke(request.refreshToken());
+        return new MessageResponse("Logged out.");
+    }
+
+    @Transactional
+    public ForgotPasswordResponse forgotPassword(ForgotPasswordRequest request) {
+        String email = normalizeEmail(request.email());
+        var user = userRepository.findByEmailIgnoreCase(email).orElse(null);
+        if (user == null || !user.isEnabled()) {
+            return new ForgotPasswordResponse(FORGOT_MESSAGE, null);
+        }
+
+        Instant now = Instant.now();
+        passwordResetTokenRepository.invalidateActiveForUser(user.getId(), now);
+
+        String rawToken = TokenHasher.generateOpaqueToken();
+        var token = new PasswordResetToken(
+                user.getId(),
+                TokenHasher.hashToken(rawToken),
+                now.plus(authProperties.resetTokenTtl())
+        );
+        passwordResetTokenRepository.save(token);
+
+        String resetPath = "/reset-password?token=" + rawToken;
+        String resetUrl = authProperties.publicAppUrl() + resetPath;
+        notificationService.notifyPasswordReset(email, resetUrl);
+        auditLogger.passwordResetRequested(email);
+
+        if (!authProperties.exposeResetPath()) {
+            return new ForgotPasswordResponse(FORGOT_MESSAGE, null);
+        }
+        return new ForgotPasswordResponse(FORGOT_MESSAGE, resetPath);
+    }
+
+    @Transactional
+    public MessageResponse resetPassword(ResetPasswordRequest request) {
+        var stored = passwordResetTokenRepository.findByTokenHash(TokenHasher.hashToken(request.token().trim()))
+                .orElseThrow(() -> new InvalidRequestException("This reset link is invalid or has expired"));
+        Instant now = Instant.now();
+        if (!stored.isUsable(now)) {
+            throw new InvalidRequestException("This reset link is invalid or has expired");
+        }
+
+        User user = userRepository.findById(stored.getUserId())
+                .orElseThrow(() -> new InvalidRequestException("This reset link is invalid or has expired"));
+        if (!user.isEnabled()) {
+            throw new InvalidRequestException("This reset link is invalid or has expired");
+        }
+
+        user.setPasswordHash(passwordEncoder.encode(request.password()));
+        stored.markUsed(now);
+        refreshTokenService.revokeAllForUser(user.getId(), "password_reset");
+        auditLogger.passwordResetCompleted(user.getId());
+        return new MessageResponse("Password updated. You can log in with the new password.");
+    }
+
+    private AuthResponse toAuthResponse(User user) {
+        var refreshToken = refreshTokenService.issueForUser(user.getId());
+        return toAuthResponse(user, refreshToken);
+    }
+
+    private AuthResponse toAuthResponse(User user, RefreshTokenService.IssuedRefreshToken refreshToken) {
+        return new AuthResponse(
+                jwtService.createAccessToken(user.getId()),
+                "Bearer",
+                jwtService.getExpirationSeconds(),
+                refreshToken.rawToken(),
+                refreshToken.expiresInSeconds(),
+                UserResponse.from(user)
+        );
+    }
+
+    private static String normalizeEmail(String email) {
+        return email.trim().toLowerCase(Locale.ROOT);
+    }
+}
+
+================================================================================
+SECTION: BACKEND - AUTH
+FILE: backend/src/main/java/com/samosajunction/auth/service/RefreshTokenService.java
+================================================================================
+
+package com.samosajunction.auth.service;
+
+import com.samosajunction.auth.config.AuthProperties;
+import com.samosajunction.auth.entity.RefreshToken;
+import com.samosajunction.auth.repository.RefreshTokenRepository;
+import com.samosajunction.auth.security.TokenHasher;
+import com.samosajunction.auth.support.SecurityAuditLogger;
+import com.samosajunction.common.exception.UnauthorizedException;
+import com.samosajunction.user.entity.User;
+import com.samosajunction.user.repository.UserRepository;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+
+import java.time.Instant;
+import java.util.UUID;
+
+// AI-ASSISTED: Cursor
+// PROMPT: Opaque refresh token minting, rotation, reuse detection, and revocation
+// ACCEPTED-BY: omprakash
+@Service
+public class RefreshTokenService {
+
+    private final RefreshTokenRepository refreshTokenRepository;
+    private final UserRepository userRepository;
+    private final AuthProperties authProperties;
+    private final SecurityAuditLogger auditLogger;
+
+    public RefreshTokenService(
+            RefreshTokenRepository refreshTokenRepository,
+            UserRepository userRepository,
+            AuthProperties authProperties,
+            SecurityAuditLogger auditLogger
+    ) {
+        this.refreshTokenRepository = refreshTokenRepository;
+        this.userRepository = userRepository;
+        this.authProperties = authProperties;
+        this.auditLogger = auditLogger;
+    }
+
+    public IssuedRefreshToken issueForUser(UUID userId) {
+        String rawToken = TokenHasher.generateOpaqueToken();
+        Instant now = Instant.now();
+        var stored = new RefreshToken(userId, TokenHasher.hashToken(rawToken), now.plus(authProperties.refreshTokenTtl()));
+        refreshTokenRepository.save(stored);
+        return new IssuedRefreshToken(rawToken, authProperties.refreshTokenTtl().getSeconds());
+    }
+
+    @Transactional
+    public RotationResult rotate(String rawRefreshToken) {
+        Instant now = Instant.now();
+        RefreshToken stored = refreshTokenRepository.findByTokenHash(TokenHasher.hashToken(rawRefreshToken.trim()))
+                .orElseThrow(() -> new UnauthorizedException("Refresh token is invalid or expired"));
+
+        if (stored.isRevoked()) {
+            handleReuse(stored);
+            throw new UnauthorizedException("Refresh token is invalid or expired");
+        }
+        if (!stored.isActive(now)) {
+            stored.revoke(now);
+            throw new UnauthorizedException("Refresh token is invalid or expired");
+        }
+
+        User user = userRepository.findWithRolesById(stored.getUserId())
+                .filter(User::isEnabled)
+                .orElseThrow(() -> new UnauthorizedException("Refresh token is invalid or expired"));
+
+        String nextRawToken = TokenHasher.generateOpaqueToken();
+        RefreshToken replacement = new RefreshToken(
+                user.getId(),
+                TokenHasher.hashToken(nextRawToken),
+                now.plus(authProperties.refreshTokenTtl())
+        );
+        refreshTokenRepository.save(replacement);
+        stored.revoke(now, replacement.getId());
+        auditLogger.refreshTokenRotated(user.getId(), stored.getId(), replacement.getId());
+        return new RotationResult(
+                user,
+                new IssuedRefreshToken(nextRawToken, authProperties.refreshTokenTtl().getSeconds())
+        );
+    }
+
+    @Transactional
+    public void revoke(String rawRefreshToken) {
+        Instant now = Instant.now();
+        refreshTokenRepository.findByTokenHash(TokenHasher.hashToken(rawRefreshToken.trim()))
+                .filter(token -> token.isActive(now))
+                .ifPresent(token -> {
+                    token.revoke(now);
+                    auditLogger.refreshTokenRevoked(token.getUserId(), "logout");
+                });
+    }
+
+    @Transactional
+    public void revokeAllForUser(UUID userId, String reason) {
+        int revoked = refreshTokenRepository.revokeAllActiveForUser(userId, Instant.now());
+        if (revoked > 0) {
+            auditLogger.refreshTokenRevoked(userId, reason);
+        }
+    }
+
+    private void handleReuse(RefreshToken stored) {
+        auditLogger.refreshTokenReuseDetected(stored.getUserId());
+        refreshTokenRepository.revokeAllActiveForUser(stored.getUserId(), Instant.now());
+    }
+
+    public record IssuedRefreshToken(String rawToken, long expiresInSeconds) {
+    }
+
+    public record RotationResult(User user, IssuedRefreshToken refreshToken) {
+    }
+}
+
+================================================================================
+SECTION: BACKEND - AUTH
+FILE: backend/src/main/java/com/samosajunction/auth/service/LoginRateLimiter.java
+================================================================================
+
+package com.samosajunction.auth.service;
+
+import com.samosajunction.auth.config.AuthProperties;
+import com.samosajunction.auth.support.SecurityAuditLogger;
+import com.samosajunction.common.exception.UnauthorizedException;
+import org.springframework.data.redis.core.StringRedisTemplate;
+import org.springframework.stereotype.Component;
+
+import java.time.Duration;
+import java.util.Locale;
+
+// AI-ASSISTED: Cursor
+// PROMPT: Redis-backed login brute-force rate limiting
+// ACCEPTED-BY: omprakash
+@Component
+public class LoginRateLimiter {
+
+    private static final String KEY_PREFIX = "auth:login:fail:";
+
+    private final StringRedisTemplate redis;
+    private final AuthProperties authProperties;
+    private final SecurityAuditLogger auditLogger;
+
+    public LoginRateLimiter(
+            StringRedisTemplate redis,
+            AuthProperties authProperties,
+            SecurityAuditLogger auditLogger
+    ) {
+        this.redis = redis;
+        this.authProperties = authProperties;
+        this.auditLogger = auditLogger;
+    }
+
+    public void checkAllowed(String clientIp, String email) {
+        int ipFailures = readFailureCount(clientIpKey(clientIp));
+        int emailFailures = readFailureCount(emailKey(normalizeEmail(email)));
+        if (ipFailures >= authProperties.maxLoginAttempts()
+                || emailFailures >= authProperties.maxLoginAttempts()) {
+            auditLogger.loginRateLimited(normalizeEmail(email), clientIp);
+            throw new UnauthorizedException("Too many login attempts. Try again later.");
+        }
+    }
+
+    public void recordFailure(String clientIp, String email) {
+        increment(clientIpKey(clientIp));
+        increment(emailKey(normalizeEmail(email)));
+    }
+
+    public void recordSuccess(String clientIp, String email) {
+        redis.delete(clientIpKey(clientIp));
+        redis.delete(emailKey(normalizeEmail(email)));
+    }
+
+    private void increment(String key) {
+        Long count = redis.opsForValue().increment(key);
+        if (count != null && count == 1L) {
+            redis.expire(key, authProperties.loginLockoutDuration());
+        }
+    }
+
+    private int readFailureCount(String key) {
+        String value = redis.opsForValue().get(key);
+        if (value == null || value.isBlank()) {
+            return 0;
+        }
+        return Integer.parseInt(value);
+    }
+
+    private static String clientIpKey(String clientIp) {
+        return KEY_PREFIX + "ip:" + clientIp;
+    }
+
+    private static String emailKey(String email) {
+        return KEY_PREFIX + "email:" + email;
+    }
+
+    private static String normalizeEmail(String email) {
+        return email.trim().toLowerCase(Locale.ROOT);
+    }
+}
+
+================================================================================
+SECTION: BACKEND - SECURITY
+FILE: backend/src/main/java/com/samosajunction/auth/security/SecurityConfig.java
+================================================================================
+
+package com.samosajunction.auth.security;
+
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.http.HttpMethod;
+import org.springframework.security.authentication.AuthenticationManager;
+import org.springframework.security.authentication.AuthenticationProvider;
+import org.springframework.security.authentication.dao.DaoAuthenticationProvider;
+import org.springframework.security.config.Customizer;
+import org.springframework.security.config.annotation.authentication.configuration.AuthenticationConfiguration;
+import org.springframework.security.config.annotation.method.configuration.EnableMethodSecurity;
+import org.springframework.security.config.annotation.web.builders.HttpSecurity;
+import org.springframework.security.config.http.SessionCreationPolicy;
+import org.springframework.security.core.userdetails.UserDetailsService;
+import org.springframework.security.crypto.bcrypt.BCryptPasswordEncoder;
+import org.springframework.security.crypto.password.PasswordEncoder;
+import org.springframework.security.web.SecurityFilterChain;
+import org.springframework.security.web.authentication.UsernamePasswordAuthenticationFilter;
+import org.springframework.security.web.header.writers.ReferrerPolicyHeaderWriter;
+import org.springframework.web.cors.CorsConfiguration;
+import org.springframework.web.cors.CorsConfigurationSource;
+import org.springframework.web.cors.UrlBasedCorsConfigurationSource;
+
+import java.util.Arrays;
+import java.util.List;
+
+// AI-ASSISTED: Cursor
+// PROMPT: Wire AuthenticationManager, security headers, and new auth endpoints
+// ACCEPTED-BY: omprakash
+@Configuration
+@EnableMethodSecurity
+public class SecurityConfig {
+
+    private final JwtAuthenticationFilter jwtAuthenticationFilter;
+    private final JsonAuthenticationEntryPoint authenticationEntryPoint;
+    private final JsonAccessDeniedHandler accessDeniedHandler;
+    private final List<String> allowedOrigins;
+
+    public SecurityConfig(
+            JwtAuthenticationFilter jwtAuthenticationFilter,
+            JsonAuthenticationEntryPoint authenticationEntryPoint,
+            JsonAccessDeniedHandler accessDeniedHandler,
+            @Value("${samosa.cors.allowed-origins}") String allowedOrigins
+    ) {
+        this.jwtAuthenticationFilter = jwtAuthenticationFilter;
+        this.authenticationEntryPoint = authenticationEntryPoint;
+        this.accessDeniedHandler = accessDeniedHandler;
+        this.allowedOrigins = Arrays.stream(allowedOrigins.split(","))
+                .map(String::trim)
+                .filter(origin -> !origin.isEmpty())
+                .toList();
+    }
+
+    @Bean
+    public SecurityFilterChain securityFilterChain(
+            HttpSecurity http,
+            AuthenticationProvider authenticationProvider
+    ) throws Exception {
+        http
+                .csrf(csrf -> csrf.disable())
+                .cors(Customizer.withDefaults())
+                .sessionManagement(session -> session.sessionCreationPolicy(SessionCreationPolicy.STATELESS))
+                .headers(headers -> headers
+                        .contentTypeOptions(Customizer.withDefaults())
+                        .frameOptions(frame -> frame.deny())
+                        .referrerPolicy(referrer -> referrer
+                                .policy(ReferrerPolicyHeaderWriter.ReferrerPolicy.STRICT_ORIGIN_WHEN_CROSS_ORIGIN))
+                        .httpStrictTransportSecurity(hsts -> hsts
+                                .includeSubDomains(true)
+                                .maxAgeInSeconds(31_536_000))
+                )
+                .exceptionHandling(exceptions -> exceptions
+                        .authenticationEntryPoint(authenticationEntryPoint)
+                        .accessDeniedHandler(accessDeniedHandler)
+                )
+                .authenticationProvider(authenticationProvider)
+                .authorizeHttpRequests(auth -> auth
+                        .requestMatchers(
+                                HttpMethod.POST,
+                                "/api/auth/register",
+                                "/api/auth/login",
+                                "/api/auth/refresh",
+                                "/api/auth/logout",
+                                "/api/auth/forgot-password",
+                                "/api/auth/reset-password"
+                        ).permitAll()
+                        .requestMatchers("/actuator/health", "/actuator/info").permitAll()
+                        .requestMatchers(HttpMethod.GET, "/api/objects").permitAll()
+                        .requestMatchers(HttpMethod.GET, "/api/products", "/api/products/*", "/api/products/*/inventory", "/api/categories").permitAll()
+                        .requestMatchers(HttpMethod.POST, "/api/products").hasAnyRole("STAFF", "ADMIN")
+                        .requestMatchers(HttpMethod.PUT, "/api/products/*").hasAnyRole("STAFF", "ADMIN")
+                        .requestMatchers(HttpMethod.DELETE, "/api/products/*").hasAnyRole("STAFF", "ADMIN")
+                        .requestMatchers(HttpMethod.POST, "/api/products/*/image").hasAnyRole("STAFF", "ADMIN")
+                        .requestMatchers(HttpMethod.DELETE, "/api/products/*/image").hasAnyRole("STAFF", "ADMIN")
+                        .requestMatchers("/api/staff/**").hasAnyRole("STAFF", "ADMIN")
+                        .requestMatchers(HttpMethod.PUT, "/api/inventory/*").hasAnyRole("STAFF", "ADMIN")
+                        .requestMatchers(HttpMethod.PATCH, "/api/complaints/*").hasAnyRole("STAFF", "ADMIN")
+                        .anyRequest().authenticated()
+                )
+                .addFilterBefore(jwtAuthenticationFilter, UsernamePasswordAuthenticationFilter.class);
+        return http.build();
+    }
+
+    @Bean
+    public AuthenticationProvider authenticationProvider(
+            UserDetailsService userDetailsService,
+            PasswordEncoder passwordEncoder
+    ) {
+        DaoAuthenticationProvider provider = new DaoAuthenticationProvider();
+        provider.setUserDetailsService(userDetailsService);
+        provider.setPasswordEncoder(passwordEncoder);
+        return provider;
+    }
+
+    @Bean
+    public AuthenticationManager authenticationManager(AuthenticationConfiguration configuration) throws Exception {
+        return configuration.getAuthenticationManager();
+    }
+
+    @Bean
+    public PasswordEncoder passwordEncoder() {
+        return new BCryptPasswordEncoder();
+    }
+
+    @Bean
+    public CorsConfigurationSource corsConfigurationSource() {
+        CorsConfiguration configuration = new CorsConfiguration();
+        configuration.setAllowedOrigins(allowedOrigins);
+        configuration.setAllowedMethods(List.of("GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"));
+        configuration.setAllowedHeaders(List.of("Authorization", "Content-Type", "Idempotency-Key"));
+        configuration.setAllowCredentials(true);
+        configuration.setMaxAge(3600L);
+
+        UrlBasedCorsConfigurationSource source = new UrlBasedCorsConfigurationSource();
+        source.registerCorsConfiguration("/api/**", configuration);
+        return source;
+    }
+}
+
+================================================================================
+SECTION: BACKEND - SECURITY
+FILE: backend/src/main/java/com/samosajunction/auth/security/JwtService.java
+================================================================================
+
+package com.samosajunction.auth.security;
+
+import io.jsonwebtoken.Claims;
+import io.jsonwebtoken.ExpiredJwtException;
+import io.jsonwebtoken.JwtException;
+import io.jsonwebtoken.Jwts;
+import io.jsonwebtoken.security.Keys;
+import io.jsonwebtoken.security.SignatureException;
+import org.springframework.stereotype.Service;
+
+import javax.crypto.SecretKey;
+import java.nio.charset.StandardCharsets;
+import java.time.Instant;
+import java.util.Date;
+import java.util.UUID;
+
+// AI-ASSISTED: Cursor
+// PROMPT: Harden JWT with iss/aud validation, clock skew, and subject-only claims
+// ACCEPTED-BY: omprakash
+@Service
+public class JwtService {
+
+    private static final int MIN_SECRET_BYTES = 32;
+
+    private final SecretKey key;
+    private final long expirationMs;
+    private final String issuer;
+    private final String audience;
+    private final long clockSkewSeconds;
+
+    public JwtService(JwtProperties properties) {
+        byte[] secretBytes = properties.secret().getBytes(StandardCharsets.UTF_8);
+        if (secretBytes.length < MIN_SECRET_BYTES) {
+            throw new IllegalStateException(
+                    "samosa.jwt.secret must be at least " + MIN_SECRET_BYTES + " bytes for HS256"
+            );
+        }
+        this.key = Keys.hmacShaKeyFor(secretBytes);
+        this.expirationMs = properties.expiration().toMillis();
+        this.issuer = properties.issuer();
+        this.audience = properties.audience();
+        this.clockSkewSeconds = properties.clockSkew().getSeconds();
+    }
+
+    /**
+     * Claims:
+     * <ul>
+     *   <li>{@code sub} — stable user id (UUID)</li>
+     *   <li>{@code iss} — token issuer, validated on parse</li>
+     *   <li>{@code aud} — intended API audience, validated on parse</li>
+     *   <li>{@code iat}/{@code exp} — lifetime bounds with configured clock skew</li>
+     * </ul>
+     * Roles and email are intentionally excluded so authorization stays server-side.
+     */
+    public String createAccessToken(UUID userId) {
+        Instant now = Instant.now();
+        Instant expiresAt = now.plusMillis(expirationMs);
+        return Jwts.builder()
+                .issuer(issuer)
+                .subject(userId.toString())
+                .audience().add(audience).and()
+                .issuedAt(Date.from(now))
+                .expiration(Date.from(expiresAt))
+                .signWith(key)
+                .compact();
+    }
+
+    public Claims parse(String token) {
+        try {
+            return Jwts.parser()
+                    .verifyWith(key)
+                    .requireIssuer(issuer)
+                    .requireAudience(audience)
+                    .clockSkewSeconds(clockSkewSeconds)
+                    .build()
+                    .parseSignedClaims(token)
+                    .getPayload();
+        } catch (ExpiredJwtException ex) {
+            throw new InvalidJwtException("JWT expired", ex);
+        } catch (SignatureException ex) {
+            throw new InvalidJwtException("JWT signature invalid", ex);
+        } catch (JwtException ex) {
+            throw new InvalidJwtException("JWT malformed or invalid", ex);
+        }
+    }
+
+    public long getExpirationSeconds() {
+        return expirationMs / 1000;
+    }
+}
+
+================================================================================
+SECTION: BACKEND - SECURITY
+FILE: backend/src/main/java/com/samosajunction/auth/security/JwtProperties.java
+================================================================================
+
+package com.samosajunction.auth.security;
+
+import org.springframework.boot.context.properties.ConfigurationProperties;
+
+import java.time.Duration;
+
+// AI-ASSISTED: Cursor
+// PROMPT: Extend JWT properties with issuer, audience, and clock skew
+// ACCEPTED-BY: omprakash
+@ConfigurationProperties(prefix = "samosa.jwt")
+public record JwtProperties(
+        String secret,
+        Duration expiration,
+        String issuer,
+        String audience,
+        Duration clockSkew
+) {
+}
+
+================================================================================
+SECTION: BACKEND - SECURITY
+FILE: backend/src/main/java/com/samosajunction/auth/security/JwtAuthenticationFilter.java
+================================================================================
+
+package com.samosajunction.auth.security;
+
+import com.samosajunction.user.repository.UserRepository;
+import jakarta.servlet.FilterChain;
+import jakarta.servlet.ServletException;
+import jakarta.servlet.http.HttpServletRequest;
+import jakarta.servlet.http.HttpServletResponse;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.http.HttpHeaders;
+import org.springframework.security.authentication.UsernamePasswordAuthenticationToken;
+import org.springframework.security.core.context.SecurityContextHolder;
+import org.springframework.security.web.authentication.WebAuthenticationDetailsSource;
+import org.springframework.stereotype.Component;
+import org.springframework.web.filter.OncePerRequestFilter;
+
+import java.io.IOException;
+import java.util.UUID;
+
+// AI-ASSISTED: Cursor
+// PROMPT: Harden JWT filter with typed failures and authenticated principal factory
+// ACCEPTED-BY: omprakash
+@Component
+public class JwtAuthenticationFilter extends OncePerRequestFilter {
+
+    private static final Logger log = LoggerFactory.getLogger(JwtAuthenticationFilter.class);
+    private static final String BEARER_PREFIX = "Bearer ";
+
+    private final JwtService jwtService;
+    private final UserRepository userRepository;
+
+    public JwtAuthenticationFilter(JwtService jwtService, UserRepository userRepository) {
+        this.jwtService = jwtService;
+        this.userRepository = userRepository;
+    }
+
+    @Override
+    protected void doFilterInternal(
+            HttpServletRequest request,
+            HttpServletResponse response,
+            FilterChain filterChain
+    ) throws ServletException, IOException {
+        String header = request.getHeader(HttpHeaders.AUTHORIZATION);
+        if (header == null || !header.startsWith(BEARER_PREFIX)) {
+            filterChain.doFilter(request, response);
+            return;
+        }
+
+        String token = header.substring(BEARER_PREFIX.length()).trim();
+        if (token.isEmpty() || SecurityContextHolder.getContext().getAuthentication() != null) {
+            filterChain.doFilter(request, response);
+            return;
+        }
+
+        try {
+            var claims = jwtService.parse(token);
+            UUID userId = UUID.fromString(claims.getSubject());
+            userRepository.findWithRolesById(userId)
+                    .filter(user -> user.isEnabled())
+                    .ifPresent(user -> setAuthentication(request, user));
+        } catch (InvalidJwtException ex) {
+            log.debug("Rejecting JWT: {}", ex.getMessage());
+            SecurityContextHolder.clearContext();
+        } catch (IllegalArgumentException ex) {
+            log.debug("Rejecting JWT with invalid subject");
+            SecurityContextHolder.clearContext();
+        }
+
+        filterChain.doFilter(request, response);
+    }
+
+    private void setAuthentication(HttpServletRequest request, com.samosajunction.user.entity.User user) {
+        var principal = UserPrincipal.forAuthenticatedUser(user);
+        var authentication = new UsernamePasswordAuthenticationToken(
+                principal,
+                null,
+                principal.getAuthorities()
+        );
+        authentication.setDetails(new WebAuthenticationDetailsSource().buildDetails(request));
+        SecurityContextHolder.getContext().setAuthentication(authentication);
+    }
+}
+
+================================================================================
+SECTION: BACKEND - SECURITY
+FILE: backend/src/main/java/com/samosajunction/auth/security/UserPrincipal.java
+================================================================================
+
+package com.samosajunction.auth.security;
+
+import com.samosajunction.user.entity.User;
+import org.springframework.security.core.GrantedAuthority;
+import org.springframework.security.core.authority.SimpleGrantedAuthority;
+import org.springframework.security.core.userdetails.UserDetails;
+
+import java.util.Collection;
+import java.util.UUID;
+
+// AI-ASSISTED: Cursor
+// PROMPT: UserDetails principal with separate JWT and credential verification factories
+// ACCEPTED-BY: omprakash
+public final class UserPrincipal implements UserDetails {
+
+    private final UUID id;
+    private final String email;
+    private final String passwordHash;
+    private final boolean enabled;
+    private final Collection<? extends GrantedAuthority> authorities;
+
+    public UserPrincipal(
+            UUID id,
+            String email,
+            String passwordHash,
+            boolean enabled,
+            Collection<? extends GrantedAuthority> authorities
+    ) {
+        this.id = id;
+        this.email = email;
+        this.passwordHash = passwordHash;
+        this.enabled = enabled;
+        this.authorities = authorities;
+    }
+
+    /** Used by {@code AuthenticationManager} during password login. */
+    public static UserPrincipal forCredentialVerification(User user) {
+        return new UserPrincipal(
+                user.getId(),
+                user.getEmail(),
+                user.getPasswordHash(),
+                user.isEnabled(),
+                toAuthorities(user)
+        );
+    }
+
+    /** Used after JWT validation; password hash is not needed in the security context. */
+    public static UserPrincipal forAuthenticatedUser(User user) {
+        return new UserPrincipal(
+                user.getId(),
+                user.getEmail(),
+                null,
+                user.isEnabled(),
+                toAuthorities(user)
+        );
+    }
+
+    private static Collection<? extends GrantedAuthority> toAuthorities(User user) {
+        return user.getRoles().stream()
+                .map(role -> new SimpleGrantedAuthority("ROLE_" + role.getName().name()))
+                .toList();
+    }
+
+    public UUID getId() {
+        return id;
+    }
+
+    @Override
+    public Collection<? extends GrantedAuthority> getAuthorities() {
+        return authorities;
+    }
+
+    @Override
+    public String getPassword() {
+        return passwordHash;
+    }
+
+    @Override
+    public String getUsername() {
+        return email;
+    }
+
+    @Override
+    public boolean isAccountNonExpired() {
+        return true;
+    }
+
+    @Override
+    public boolean isAccountNonLocked() {
+        return true;
+    }
+
+    @Override
+    public boolean isCredentialsNonExpired() {
+        return true;
+    }
+
+    @Override
+    public boolean isEnabled() {
+        return enabled;
+    }
+}
+
+================================================================================
+SECTION: BACKEND - SECURITY
+FILE: backend/src/main/java/com/samosajunction/auth/security/SamosaUserDetailsService.java
+================================================================================
+
+package com.samosajunction.auth.security;
+
+import com.samosajunction.user.repository.UserRepository;
+import org.springframework.security.core.userdetails.UserDetails;
+import org.springframework.security.core.userdetails.UserDetailsService;
+import org.springframework.security.core.userdetails.UsernameNotFoundException;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+
+// AI-ASSISTED: Cursor
+// PROMPT: Add UserDetailsService for AuthenticationManager login flow
+// ACCEPTED-BY: omprakash
+@Service
+public class SamosaUserDetailsService implements UserDetailsService {
+
+    private final UserRepository userRepository;
+
+    public SamosaUserDetailsService(UserRepository userRepository) {
+        this.userRepository = userRepository;
+    }
+
+    @Override
+    @Transactional(readOnly = true)
+    public UserDetails loadUserByUsername(String username) {
+        return userRepository.findByEmailIgnoreCase(username)
+                .map(UserPrincipal::forCredentialVerification)
+                .orElseThrow(() -> new UsernameNotFoundException("Invalid email or password"));
+    }
+}
+
+================================================================================
+SECTION: BACKEND - SECURITY
+FILE: backend/src/main/java/com/samosajunction/auth/security/TokenHasher.java
+================================================================================
+
+package com.samosajunction.auth.security;
+
+import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
+import java.security.SecureRandom;
+import java.util.Base64;
+import java.util.HexFormat;
+
+// AI-ASSISTED: Cursor
+// PROMPT: Shared secure token hashing and opaque token generation
+// ACCEPTED-BY: omprakash
+public final class TokenHasher {
+
+    private static final SecureRandom SECURE_RANDOM = new SecureRandom();
+
+    private TokenHasher() {
+    }
+
+    public static String generateOpaqueToken() {
+        byte[] bytes = new byte[32];
+        SECURE_RANDOM.nextBytes(bytes);
+        return Base64.getUrlEncoder().withoutPadding().encodeToString(bytes);
+    }
+
+    public static String hashToken(String rawToken) {
+        try {
+            byte[] digest = MessageDigest.getInstance("SHA-256")
+                    .digest(rawToken.getBytes(StandardCharsets.UTF_8));
+            return HexFormat.of().formatHex(digest);
+        } catch (NoSuchAlgorithmException ex) {
+            throw new IllegalStateException("SHA-256 is required for opaque token hashing", ex);
+        }
+    }
+}
+
+================================================================================
+SECTION: BACKEND - SECURITY
+FILE: backend/src/main/java/com/samosajunction/auth/security/JsonAuthenticationEntryPoint.java
+================================================================================
+
+package com.samosajunction.auth.security;
+
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.samosajunction.common.response.ApiError;
+import jakarta.servlet.http.HttpServletRequest;
+import jakarta.servlet.http.HttpServletResponse;
+import org.springframework.http.HttpStatus;
+import org.springframework.http.MediaType;
+import org.springframework.security.core.AuthenticationException;
+import org.springframework.security.web.AuthenticationEntryPoint;
+import org.springframework.stereotype.Component;
+
+import java.io.IOException;
+
+@Component
+public class JsonAuthenticationEntryPoint implements AuthenticationEntryPoint {
+
+    private final ObjectMapper objectMapper;
+
+    public JsonAuthenticationEntryPoint(ObjectMapper objectMapper) {
+        this.objectMapper = objectMapper;
+    }
+
+    @Override
+    public void commence(
+            HttpServletRequest request,
+            HttpServletResponse response,
+            AuthenticationException authException
+    ) throws IOException {
+        write(response, HttpStatus.UNAUTHORIZED, "UNAUTHORIZED", "Authentication is required", request.getRequestURI());
+    }
+
+    public void write(HttpServletResponse response, HttpStatus status, String code, String message, String path)
+            throws IOException {
+        response.setStatus(status.value());
+        response.setContentType(MediaType.APPLICATION_JSON_VALUE);
+        objectMapper.writeValue(response.getOutputStream(), ApiError.of(status.value(), code, message, path));
+    }
+}
+
+================================================================================
+SECTION: BACKEND - SECURITY
+FILE: backend/src/main/java/com/samosajunction/auth/security/JsonAccessDeniedHandler.java
+================================================================================
+
+package com.samosajunction.auth.security;
+
+import com.samosajunction.common.response.ApiError;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import jakarta.servlet.http.HttpServletRequest;
+import jakarta.servlet.http.HttpServletResponse;
+import org.springframework.http.HttpStatus;
+import org.springframework.http.MediaType;
+import org.springframework.security.access.AccessDeniedException;
+import org.springframework.security.web.access.AccessDeniedHandler;
+import org.springframework.stereotype.Component;
+
+import java.io.IOException;
+
+@Component
+public class JsonAccessDeniedHandler implements AccessDeniedHandler {
+
+    private final ObjectMapper objectMapper;
+
+    public JsonAccessDeniedHandler(ObjectMapper objectMapper) {
+        this.objectMapper = objectMapper;
+    }
+
+    @Override
+    public void handle(
+            HttpServletRequest request,
+            HttpServletResponse response,
+            AccessDeniedException accessDeniedException
+    ) throws IOException {
+        response.setStatus(HttpStatus.FORBIDDEN.value());
+        response.setContentType(MediaType.APPLICATION_JSON_VALUE);
+        objectMapper.writeValue(
+                response.getOutputStream(),
+                ApiError.of(HttpStatus.FORBIDDEN.value(), "FORBIDDEN", "Access is denied", request.getRequestURI())
+        );
+    }
+}
+
+================================================================================
+SECTION: BACKEND - SECURITY
+FILE: backend/src/main/java/com/samosajunction/auth/security/InvalidJwtException.java
+================================================================================
+
+package com.samosajunction.auth.security;
+
+// AI-ASSISTED: Cursor
+// PROMPT: Typed JWT validation failure for filter handling
+// ACCEPTED-BY: omprakash
+public class InvalidJwtException extends RuntimeException {
+
+    public InvalidJwtException(String message, Throwable cause) {
+        super(message, cause);
+    }
+}
+
+================================================================================
+SECTION: BACKEND - CONFIG
+FILE: backend/src/main/java/com/samosajunction/auth/config/AuthProperties.java
+================================================================================
+
+package com.samosajunction.auth.config;
+
+import org.springframework.boot.context.properties.ConfigurationProperties;
+
+import java.time.Duration;
+
+// AI-ASSISTED: Cursor
+// PROMPT: Extend auth properties for refresh tokens and login rate limiting
+// ACCEPTED-BY: omprakash
+@ConfigurationProperties(prefix = "samosa.auth")
+public record AuthProperties(
+        Duration resetTokenTtl,
+        boolean exposeResetPath,
+        String publicAppUrl,
+        Duration refreshTokenTtl,
+        int maxLoginAttempts,
+        Duration loginLockoutDuration
+) {
+}
+
+================================================================================
+SECTION: BACKEND - CONFIG
+FILE: backend/src/main/java/com/samosajunction/auth/config/JwtSecretProductionValidator.java
+================================================================================
+
+package com.samosajunction.auth.config;
+
+import com.samosajunction.auth.security.JwtProperties;
+import org.springframework.boot.context.event.ApplicationReadyEvent;
+import org.springframework.context.annotation.Profile;
+import org.springframework.context.event.EventListener;
+import org.springframework.stereotype.Component;
+
+// AI-ASSISTED: Cursor
+// PROMPT: Fail fast in prod when default JWT secret is used
+// ACCEPTED-BY: omprakash
+@Component
+@Profile("prod")
+public class JwtSecretProductionValidator {
+
+    private static final String DEV_DEFAULT_SECRET = "local-dev-only-change-me-32bytes-min-key!";
+
+    private final JwtProperties jwtProperties;
+
+    public JwtSecretProductionValidator(JwtProperties jwtProperties) {
+        this.jwtProperties = jwtProperties;
+    }
+
+    @EventListener(ApplicationReadyEvent.class)
+    public void validateSecret() {
+        if (DEV_DEFAULT_SECRET.equals(jwtProperties.secret())) {
+            throw new IllegalStateException(
+                    "Production startup blocked: set JWT_SECRET to a unique value of at least 32 bytes"
+            );
+        }
+    }
+}
+
+================================================================================
+SECTION: BACKEND - ENTITIES
+FILE: backend/src/main/java/com/samosajunction/auth/entity/PasswordResetToken.java
+================================================================================
+
+package com.samosajunction.auth.entity;
+
+import jakarta.persistence.Column;
+import jakarta.persistence.Entity;
+import jakarta.persistence.EntityListeners;
+import jakarta.persistence.GeneratedValue;
+import jakarta.persistence.GenerationType;
+import jakarta.persistence.Id;
+import jakarta.persistence.Table;
+import org.springframework.data.annotation.CreatedDate;
+import org.springframework.data.jpa.domain.support.AuditingEntityListener;
+
+import java.time.Instant;
+import java.util.UUID;
+
+@Entity
+@Table(name = "password_reset_tokens")
+@EntityListeners(AuditingEntityListener.class)
+public class PasswordResetToken {
+
+    @Id
+    @GeneratedValue(strategy = GenerationType.UUID)
+    private UUID id;
+
+    @Column(name = "user_id", nullable = false)
+    private UUID userId;
+
+    @Column(name = "token_hash", nullable = false, unique = true, length = 64)
+    private String tokenHash;
+
+    @Column(name = "expires_at", nullable = false)
+    private Instant expiresAt;
+
+    @Column(name = "used_at")
+    private Instant usedAt;
+
+    @CreatedDate
+    @Column(name = "created_at", nullable = false, updatable = false)
+    private Instant createdAt;
+
+    protected PasswordResetToken() {
+    }
+
+    public PasswordResetToken(UUID userId, String tokenHash, Instant expiresAt) {
+        this.userId = userId;
+        this.tokenHash = tokenHash;
+        this.expiresAt = expiresAt;
+    }
+
+    public void markUsed(Instant at) {
+        this.usedAt = at;
+    }
+
+    public boolean isUsable(Instant now) {
+        return usedAt == null && now.isBefore(expiresAt);
+    }
+
+    public UUID getId() {
+        return id;
+    }
+
+    public UUID getUserId() {
+        return userId;
+    }
+
+    public String getTokenHash() {
+        return tokenHash;
+    }
+
+    public Instant getExpiresAt() {
+        return expiresAt;
+    }
+
+    public Instant getUsedAt() {
+        return usedAt;
+    }
+}
+
+================================================================================
+SECTION: BACKEND - ENTITIES
+FILE: backend/src/main/java/com/samosajunction/auth/entity/RefreshToken.java
+================================================================================
+
+package com.samosajunction.auth.entity;
+
+import jakarta.persistence.Column;
+import jakarta.persistence.Entity;
+import jakarta.persistence.EntityListeners;
+import jakarta.persistence.GeneratedValue;
+import jakarta.persistence.GenerationType;
+import jakarta.persistence.Id;
+import jakarta.persistence.Table;
+import org.springframework.data.annotation.CreatedDate;
+import org.springframework.data.jpa.domain.support.AuditingEntityListener;
+
+import java.time.Instant;
+import java.util.UUID;
+
+// AI-ASSISTED: Cursor
+// PROMPT: Refresh token entity with revocation and rotation support
+// ACCEPTED-BY: omprakash
+@Entity
+@Table(name = "refresh_tokens")
+@EntityListeners(AuditingEntityListener.class)
+public class RefreshToken {
+
+    @Id
+    @GeneratedValue(strategy = GenerationType.UUID)
+    private UUID id;
+
+    @Column(name = "user_id", nullable = false)
+    private UUID userId;
+
+    @Column(name = "token_hash", nullable = false, unique = true, length = 64)
+    private String tokenHash;
+
+    @Column(name = "expires_at", nullable = false)
+    private Instant expiresAt;
+
+    @Column(name = "revoked_at")
+    private Instant revokedAt;
+
+    @Column(name = "replaced_by_token_id")
+    private UUID replacedByTokenId;
+
+    @CreatedDate
+    @Column(name = "created_at", nullable = false, updatable = false)
+    private Instant createdAt;
+
+    protected RefreshToken() {
+    }
+
+    public RefreshToken(UUID userId, String tokenHash, Instant expiresAt) {
+        this.userId = userId;
+        this.tokenHash = tokenHash;
+        this.expiresAt = expiresAt;
+    }
+
+    public boolean isActive(Instant now) {
+        return revokedAt == null && now.isBefore(expiresAt);
+    }
+
+    public boolean isRevoked() {
+        return revokedAt != null;
+    }
+
+    public void revoke(Instant at, UUID replacementId) {
+        this.revokedAt = at;
+        this.replacedByTokenId = replacementId;
+    }
+
+    public void revoke(Instant at) {
+        this.revokedAt = at;
+    }
+
+    public UUID getId() {
+        return id;
+    }
+
+    public UUID getUserId() {
+        return userId;
+    }
+
+    public String getTokenHash() {
+        return tokenHash;
+    }
+
+    public Instant getExpiresAt() {
+        return expiresAt;
+    }
+
+    public Instant getRevokedAt() {
+        return revokedAt;
+    }
+
+    public UUID getReplacedByTokenId() {
+        return replacedByTokenId;
+    }
+}
+
+================================================================================
+SECTION: BACKEND - ENTITIES
+FILE: backend/src/main/java/com/samosajunction/auth/repository/PasswordResetTokenRepository.java
+================================================================================
+
+package com.samosajunction.auth.repository;
+
+import com.samosajunction.auth.entity.PasswordResetToken;
+import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.data.jpa.repository.Modifying;
+import org.springframework.data.jpa.repository.Query;
+import org.springframework.data.repository.query.Param;
+
+import java.time.Instant;
+import java.util.Optional;
+import java.util.UUID;
+
+// AI-ASSISTED: Cursor
+// PROMPT: Invalidate active password reset tokens when issuing a new one
+// ACCEPTED-BY: omprakash
+public interface PasswordResetTokenRepository extends JpaRepository<PasswordResetToken, UUID> {
+
+    Optional<PasswordResetToken> findByTokenHash(String tokenHash);
+
+    @Modifying
+    @Query("""
+            UPDATE PasswordResetToken token
+            SET token.usedAt = :usedAt
+            WHERE token.userId = :userId
+              AND token.usedAt IS NULL
+            """)
+    int invalidateActiveForUser(@Param("userId") UUID userId, @Param("usedAt") Instant usedAt);
+}
+
+================================================================================
+SECTION: BACKEND - ENTITIES
+FILE: backend/src/main/java/com/samosajunction/auth/repository/RefreshTokenRepository.java
+================================================================================
+
+package com.samosajunction.auth.repository;
+
+import com.samosajunction.auth.entity.RefreshToken;
+import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.data.jpa.repository.Modifying;
+import org.springframework.data.jpa.repository.Query;
+import org.springframework.data.repository.query.Param;
+
+import java.time.Instant;
+import java.util.Optional;
+import java.util.UUID;
+
+// AI-ASSISTED: Cursor
+// PROMPT: Refresh token repository with revocation queries
+// ACCEPTED-BY: omprakash
+public interface RefreshTokenRepository extends JpaRepository<RefreshToken, UUID> {
+
+    Optional<RefreshToken> findByTokenHash(String tokenHash);
+
+    @Modifying
+    @Query("""
+            UPDATE RefreshToken token
+            SET token.revokedAt = :revokedAt
+            WHERE token.userId = :userId
+              AND token.revokedAt IS NULL
+            """)
+    int revokeAllActiveForUser(@Param("userId") UUID userId, @Param("revokedAt") Instant revokedAt);
+}
+
+================================================================================
+SECTION: BACKEND - DTOs
+FILE: backend/src/main/java/com/samosajunction/auth/dto/AuthResponse.java
+================================================================================
+
+package com.samosajunction.auth.dto;
+
+import com.samosajunction.user.dto.UserResponse;
+
+// AI-ASSISTED: Cursor
+// PROMPT: Extend auth response with refresh token fields
+// ACCEPTED-BY: omprakash
+public record AuthResponse(
+        String accessToken,
+        String tokenType,
+        long expiresInSeconds,
+        String refreshToken,
+        long refreshExpiresInSeconds,
+        UserResponse user
+) {
+}
+
+================================================================================
+SECTION: BACKEND - DTOs
+FILE: backend/src/main/java/com/samosajunction/auth/dto/LoginRequest.java
+================================================================================
+
+package com.samosajunction.auth.dto;
+
+import jakarta.validation.constraints.Email;
+import jakarta.validation.constraints.NotBlank;
+import jakarta.validation.constraints.Size;
+
+public record LoginRequest(
+        @NotBlank @Email String email,
+        @NotBlank @Size(max = 72) String password
+) {
+}
+
+================================================================================
+SECTION: BACKEND - DTOs
+FILE: backend/src/main/java/com/samosajunction/auth/dto/RegisterRequest.java
+================================================================================
+
+package com.samosajunction.auth.dto;
+
+import jakarta.validation.constraints.Email;
+import jakarta.validation.constraints.NotBlank;
+import jakarta.validation.constraints.Size;
+
+public record RegisterRequest(
+        @NotBlank @Email @Size(max = 320) String email,
+        @NotBlank @Size(min = 8, max = 72) String password,
+        @NotBlank @Size(max = 120) String fullName
+) {
+}
+
+================================================================================
+SECTION: BACKEND - DTOs
+FILE: backend/src/main/java/com/samosajunction/auth/dto/ForgotPasswordRequest.java
+================================================================================
+
+package com.samosajunction.auth.dto;
+
+import jakarta.validation.constraints.Email;
+import jakarta.validation.constraints.NotBlank;
+import jakarta.validation.constraints.Size;
+
+public record ForgotPasswordRequest(
+        @NotBlank @Email @Size(max = 320) String email
+) {
+}
+
+================================================================================
+SECTION: BACKEND - DTOs
+FILE: backend/src/main/java/com/samosajunction/auth/dto/ForgotPasswordResponse.java
+================================================================================
+
+package com.samosajunction.auth.dto;
+
+import com.fasterxml.jackson.annotation.JsonInclude;
+
+@JsonInclude(JsonInclude.Include.NON_NULL)
+public record ForgotPasswordResponse(String message, String resetPath) {
+}
+
+================================================================================
+SECTION: BACKEND - DTOs
+FILE: backend/src/main/java/com/samosajunction/auth/dto/ResetPasswordRequest.java
+================================================================================
+
+package com.samosajunction.auth.dto;
+
+import jakarta.validation.constraints.NotBlank;
+import jakarta.validation.constraints.Size;
+
+public record ResetPasswordRequest(
+        @NotBlank String token,
+        @NotBlank @Size(min = 8, max = 72) String password
+) {
+}
+
+================================================================================
+SECTION: BACKEND - DTOs
+FILE: backend/src/main/java/com/samosajunction/auth/dto/RefreshTokenRequest.java
+================================================================================
+
+package com.samosajunction.auth.dto;
+
+import jakarta.validation.constraints.NotBlank;
+
+// AI-ASSISTED: Cursor
+// PROMPT: Refresh token rotation request DTO
+// ACCEPTED-BY: omprakash
+public record RefreshTokenRequest(@NotBlank String refreshToken) {
+}
+
+================================================================================
+SECTION: BACKEND - DTOs
+FILE: backend/src/main/java/com/samosajunction/auth/dto/LogoutRequest.java
+================================================================================
+
+package com.samosajunction.auth.dto;
+
+import jakarta.validation.constraints.NotBlank;
+
+// AI-ASSISTED: Cursor
+// PROMPT: Logout request DTO for refresh token revocation
+// ACCEPTED-BY: omprakash
+public record LogoutRequest(@NotBlank String refreshToken) {
+}
+
+================================================================================
+SECTION: BACKEND - DTOs
+FILE: backend/src/main/java/com/samosajunction/auth/dto/MessageResponse.java
+================================================================================
+
+package com.samosajunction.auth.dto;
+
+public record MessageResponse(String message) {
+}
+
+================================================================================
+SECTION: BACKEND - SUPPORT
+FILE: backend/src/main/java/com/samosajunction/auth/support/SecurityAuditLogger.java
+================================================================================
+
+package com.samosajunction.auth.support;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.stereotype.Component;
+
+import java.util.UUID;
+
+// AI-ASSISTED: Cursor
+// PROMPT: Structured security audit logging without secrets
+// ACCEPTED-BY: omprakash
+@Component
+public class SecurityAuditLogger {
+
+    private static final Logger log = LoggerFactory.getLogger(SecurityAuditLogger.class);
+
+    public void loginSucceeded(UUID userId, String email, String clientIp) {
+        log.info("security_event=login_success userId={} email={} clientIp={}", userId, email, clientIp);
+    }
+
+    public void loginFailed(String email, String clientIp, String reason) {
+        log.warn("security_event=login_failure email={} clientIp={} reason={}", email, clientIp, reason);
+    }
+
+    public void passwordResetRequested(String email) {
+        log.info("security_event=password_reset_requested email={}", email);
+    }
+
+    public void passwordResetCompleted(UUID userId) {
+        log.info("security_event=password_reset_completed userId={}", userId);
+    }
+
+    public void refreshTokenRotated(UUID userId, UUID oldTokenId, UUID newTokenId) {
+        log.info("security_event=refresh_token_rotated userId={} oldTokenId={} newTokenId={}",
+                userId, oldTokenId, newTokenId);
+    }
+
+    public void refreshTokenReuseDetected(UUID userId) {
+        log.warn("security_event=refresh_token_reuse_detected userId={}", userId);
+    }
+
+    public void refreshTokenRevoked(UUID userId, String reason) {
+        log.info("security_event=refresh_token_revoked userId={} reason={}", userId, reason);
+    }
+
+    public void loginRateLimited(String email, String clientIp) {
+        log.warn("security_event=login_rate_limited email={} clientIp={}", email, clientIp);
+    }
+}
+
+================================================================================
+SECTION: BACKEND - SUPPORT
+FILE: backend/src/main/java/com/samosajunction/auth/support/ClientIpResolver.java
+================================================================================
+
+package com.samosajunction.auth.support;
+
+import jakarta.servlet.http.HttpServletRequest;
+
+// AI-ASSISTED: Cursor
+// PROMPT: Resolve client IP for login rate limiting behind proxies
+// ACCEPTED-BY: omprakash
+public final class ClientIpResolver {
+
+    private ClientIpResolver() {
+    }
+
+    public static String resolve(HttpServletRequest request) {
+        String forwarded = request.getHeader("X-Forwarded-For");
+        if (forwarded != null && !forwarded.isBlank()) {
+            return forwarded.split(",")[0].trim();
+        }
+        return request.getRemoteAddr();
+    }
+}
+
+================================================================================
+SECTION: BACKEND - NOTIFICATIONS
+FILE: backend/src/main/java/com/samosajunction/notification/service/NotificationService.java
+================================================================================
+
+package com.samosajunction.notification.service;
+
+import com.samosajunction.common.event.DomainEvent;
+import com.samosajunction.common.event.DomainEventType;
+import com.samosajunction.notification.channel.NotificationChannel;
+import com.samosajunction.notification.channel.NotificationMessage;
+import com.samosajunction.notification.entity.NotificationLog;
+import com.samosajunction.notification.repository.NotificationLogRepository;
+import com.samosajunction.user.entity.User;
+import com.samosajunction.user.repository.UserRepository;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+
+import java.util.List;
+import java.util.Set;
+import java.util.UUID;
+
+@Service
+public class NotificationService {
+
+    private static final Logger log = LoggerFactory.getLogger(NotificationService.class);
+    private static final Set<DomainEventType> NOTIFIABLE = Set.of(
+            DomainEventType.ORDER_CONFIRMED,
+            DomainEventType.ORDER_PREPARING,
+            DomainEventType.ORDER_READY,
+            DomainEventType.ORDER_OUT_FOR_DELIVERY,
+            DomainEventType.ORDER_DELIVERED,
+            DomainEventType.ORDER_CANCELLED,
+            DomainEventType.PAYMENT_FAILED,
+            DomainEventType.COMPLAINT_CREATED,
+            DomainEventType.COMPLAINT_UPDATED
+    );
+
+    private final List<NotificationChannel> channels;
+    private final NotificationLogRepository notificationLogRepository;
+    private final UserRepository userRepository;
+
+    public NotificationService(
+            List<NotificationChannel> channels,
+            NotificationLogRepository notificationLogRepository,
+            UserRepository userRepository
+    ) {
+        this.channels = channels;
+        this.notificationLogRepository = notificationLogRepository;
+        this.userRepository = userRepository;
+    }
+
+    @Transactional
+    public void notify(DomainEvent event) {
+        if (!NOTIFIABLE.contains(event.type())) {
+            return;
+        }
+        String recipient = userRepository.findById(event.userId())
+                .map(User::getEmail)
+                .orElse("user:" + event.userId());
+        String body = switch (event.type()) {
+            case ORDER_CONFIRMED -> "Your Samosa Junction order is confirmed.";
+            case ORDER_PREPARING -> "Your Samosa Junction order is being prepared.";
+            case ORDER_READY -> "Your Samosa Junction order is ready.";
+            case ORDER_OUT_FOR_DELIVERY -> "Your Samosa Junction order is out for delivery.";
+            case ORDER_DELIVERED -> "Your Samosa Junction order has been delivered. Enjoy.";
+            case ORDER_CANCELLED -> "Your Samosa Junction order was cancelled.";
+            case PAYMENT_FAILED -> "Payment for your Samosa Junction order failed. You can retry.";
+            case COMPLAINT_CREATED -> "We received your complaint. Our team will review it.";
+            case COMPLAINT_UPDATED -> "Your complaint status was updated.";
+            default -> event.type().name();
+        };
+        NotificationMessage message = new NotificationMessage(event, recipient, body);
+        for (NotificationChannel channel : channels) {
+            channel.send(message);
+            notificationLogRepository.save(new NotificationLog(
+                    event.eventId(),
+                    event.type().name(),
+                    channel.name(),
+                    recipient
+            ));
+        }
+        log.debug("Notified {} channels for {}", channels.size(), event.type());
+    }
+
+    @Transactional
+    public void notifyPasswordReset(String email, String resetUrl) {
+        UUID eventId = UUID.randomUUID();
+        var event = DomainEvent.of(DomainEventType.PASSWORD_RESET, eventId, eventId, eventId.toString());
+        String body = "Reset your Samosa Junction password: " + resetUrl;
+        NotificationMessage message = new NotificationMessage(event, email, body);
+        for (NotificationChannel channel : channels) {
+            if (!"EMAIL".equals(channel.name())) {
+                continue;
+            }
+            channel.send(message);
+            notificationLogRepository.save(new NotificationLog(eventId, "PASSWORD_RESET", channel.name(), email));
+        }
+    }
+}
+
+================================================================================
+SECTION: BACKEND - NOTIFICATIONS
+FILE: backend/src/main/java/com/samosajunction/notification/channel/LoggingEmailNotificationService.java
+================================================================================
+
+package com.samosajunction.notification.channel;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.stereotype.Component;
+
+@Component
+public class LoggingEmailNotificationService implements NotificationChannel {
+
+    private static final Logger log = LoggerFactory.getLogger(LoggingEmailNotificationService.class);
+
+    @Override
+    public String name() {
+        return "EMAIL";
+    }
+
+    @Override
+    public void send(NotificationMessage message) {
+        log.info("EMAIL to {} :: {}", message.recipientKey(), message.body());
+    }
+}
+
+================================================================================
+SECTION: BACKEND - TESTS
+FILE: backend/src/test/java/com/samosajunction/auth/service/AuthServiceTest.java
+================================================================================
+
+package com.samosajunction.auth.service;
+
+
+import com.samosajunction.auth.config.AuthProperties;
+import com.samosajunction.auth.dto.ForgotPasswordRequest;
+import com.samosajunction.auth.dto.LoginRequest;
+import com.samosajunction.auth.dto.RegisterRequest;
+import com.samosajunction.auth.dto.ResetPasswordRequest;
+import com.samosajunction.auth.entity.PasswordResetToken;
+import com.samosajunction.auth.repository.PasswordResetTokenRepository;
+import com.samosajunction.auth.security.JwtService;
+import com.samosajunction.auth.security.TokenHasher;
+import com.samosajunction.auth.security.UserPrincipal;
+import com.samosajunction.auth.support.SecurityAuditLogger;
+import com.samosajunction.common.exception.InvalidRequestException;
+import com.samosajunction.common.exception.ResourceConflictException;
+import com.samosajunction.common.exception.UnauthorizedException;
+import com.samosajunction.notification.service.NotificationService;
+import com.samosajunction.user.entity.Role;
+import com.samosajunction.user.entity.RoleName;
+import com.samosajunction.user.entity.User;
+import com.samosajunction.user.repository.RoleRepository;
+import com.samosajunction.user.repository.UserRepository;
+import com.samosajunction.wallet.service.WalletService;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.extension.ExtendWith;
+import org.mockito.ArgumentCaptor;
+import org.mockito.Mock;
+import org.mockito.junit.jupiter.MockitoExtension;
+import org.springframework.security.authentication.AuthenticationManager;
+import org.springframework.security.authentication.BadCredentialsException;
+import org.springframework.security.authentication.UsernamePasswordAuthenticationToken;
+import org.springframework.security.crypto.bcrypt.BCryptPasswordEncoder;
+import org.springframework.security.crypto.password.PasswordEncoder;
+import org.springframework.test.util.ReflectionTestUtils;
+
+import java.time.Duration;
+import java.time.Instant;
+import java.util.Optional;
+import java.util.UUID;
+
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.doNothing;
+import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.when;
+
+@ExtendWith(MockitoExtension.class)
+class AuthServiceTest {
+
+    @Mock
+    private UserRepository userRepository;
+
+    @Mock
+    private RoleRepository roleRepository;
+
+    @Mock
+    private JwtService jwtService;
+
+    @Mock
+    private WalletService walletService;
+
+    @Mock
+    private PasswordResetTokenRepository passwordResetTokenRepository;
+
+    @Mock
+    private RefreshTokenService refreshTokenService;
+
+    @Mock
+    private NotificationService notificationService;
+
+    @Mock
+    private AuthenticationManager authenticationManager;
+
+    @Mock
+    private LoginRateLimiter loginRateLimiter;
+
+    @Mock
+    private SecurityAuditLogger auditLogger;
+
+    private final PasswordEncoder passwordEncoder = new BCryptPasswordEncoder();
+    private final AuthProperties authProperties = new AuthProperties(
+            Duration.ofMinutes(30),
+            true,
+            "http://localhost:5173",
+            Duration.ofDays(7),
+            10,
+            Duration.ofMinutes(15)
+    );
+
+    private AuthService authService;
+
+    @BeforeEach
+    void setUp() {
+        authService = new AuthService(
+                userRepository,
+                roleRepository,
+                passwordEncoder,
+                authenticationManager,
+                jwtService,
+                walletService,
+                passwordResetTokenRepository,
+                refreshTokenService,
+                authProperties,
+                notificationService,
+                loginRateLimiter,
+                auditLogger
+        );
+    }
+
+    @Test
+    void registerHashesPasswordAndIssuesToken() {
+        when(userRepository.existsByEmailIgnoreCase("ada@samosa.test")).thenReturn(false);
+        when(roleRepository.findByName(RoleName.CUSTOMER)).thenReturn(Optional.of(new Role(RoleName.CUSTOMER)));
+        when(jwtService.createAccessToken(any())).thenReturn("jwt-token");
+        when(jwtService.getExpirationSeconds()).thenReturn(3600L);
+        when(refreshTokenService.issueForUser(any())).thenReturn(new RefreshTokenService.IssuedRefreshToken("refresh", 604800L));
+        when(userRepository.save(any(User.class))).thenAnswer(invocation -> {
+            User user = invocation.getArgument(0);
+            ReflectionTestUtils.setField(user, "id", UUID.randomUUID());
+            return user;
+        });
+
+        var response = authService.register(
+                new RegisterRequest("Ada@samosa.test", "password1", "Ada Lovelace")
+        );
+
+        ArgumentCaptor<User> saved = ArgumentCaptor.forClass(User.class);
+        verify(userRepository).save(saved.capture());
+        verify(walletService).createForNewUser(saved.getValue().getId());
+        assertThat(saved.getValue().getEmail()).isEqualTo("ada@samosa.test");
+        assertThat(saved.getValue().getPasswordHash()).isNotEqualTo("password1");
+        assertThat(passwordEncoder.matches("password1", saved.getValue().getPasswordHash())).isTrue();
+        assertThat(response.accessToken()).isEqualTo("jwt-token");
+        assertThat(response.refreshToken()).isEqualTo("refresh");
+        assertThat(response.tokenType()).isEqualTo("Bearer");
+        assertThat(response.user().roles()).containsExactly("CUSTOMER");
+    }
+
+    @Test
+    void registerRejectsDuplicateEmail() {
+        when(userRepository.existsByEmailIgnoreCase("ada@samosa.test")).thenReturn(true);
+
+        assertThatThrownBy(() -> authService.register(
+                new RegisterRequest("ada@samosa.test", "password1", "Ada")
+        )).isInstanceOf(ResourceConflictException.class);
+
+        verify(userRepository, never()).save(any());
+    }
+
+    @Test
+    void loginSucceedsViaAuthenticationManager() {
+        UUID userId = UUID.randomUUID();
+        User user = new User("ada@samosa.test", passwordEncoder.encode("password1"), "Ada");
+        user.addRole(new Role(RoleName.CUSTOMER));
+        ReflectionTestUtils.setField(user, "id", userId);
+        var principal = UserPrincipal.forCredentialVerification(user);
+        when(authenticationManager.authenticate(any(UsernamePasswordAuthenticationToken.class)))
+                .thenReturn(new UsernamePasswordAuthenticationToken(principal, null, principal.getAuthorities()));
+        when(userRepository.findWithRolesById(userId)).thenReturn(Optional.of(user));
+        when(jwtService.createAccessToken(userId)).thenReturn("jwt-token");
+        when(jwtService.getExpirationSeconds()).thenReturn(900L);
+        when(refreshTokenService.issueForUser(userId)).thenReturn(new RefreshTokenService.IssuedRefreshToken("refresh", 604800L));
+        doNothing().when(loginRateLimiter).checkAllowed(anyString(), anyString());
+        doNothing().when(loginRateLimiter).recordSuccess(anyString(), anyString());
+
+        var response = authService.login(new LoginRequest("ADA@samosa.test", "password1"), "127.0.0.1");
+
+        assertThat(response.accessToken()).isEqualTo("jwt-token");
+        assertThat(response.refreshToken()).isEqualTo("refresh");
+        assertThat(response.user().email()).isEqualTo("ada@samosa.test");
+        verify(auditLogger).loginSucceeded(userId, "ada@samosa.test", "127.0.0.1");
+    }
+
+    @Test
+    void loginRejectsBadCredentials() {
+        doNothing().when(loginRateLimiter).checkAllowed(anyString(), anyString());
+        when(authenticationManager.authenticate(any())).thenThrow(new BadCredentialsException("bad"));
+
+        assertThatThrownBy(() -> authService.login(new LoginRequest("ada@samosa.test", "wrong-pass"), "127.0.0.1"))
+                .isInstanceOf(UnauthorizedException.class)
+                .hasMessage("Invalid email or password");
+        verify(jwtService, never()).createAccessToken(any());
+        verify(loginRateLimiter).recordFailure("127.0.0.1", "ada@samosa.test");
+    }
+
+    @Test
+    void forgotPasswordDoesNotRevealUnknownEmail() {
+        when(userRepository.findByEmailIgnoreCase("missing@samosa.test")).thenReturn(Optional.empty());
+
+        var response = authService.forgotPassword(new ForgotPasswordRequest("missing@samosa.test"));
+
+        assertThat(response.resetPath()).isNull();
+        verify(passwordResetTokenRepository, never()).save(any());
+    }
+
+    @Test
+    void forgotPasswordInvalidatesExistingTokens() {
+        User user = new User("ada@samosa.test", passwordEncoder.encode("password1"), "Ada");
+        ReflectionTestUtils.setField(user, "id", UUID.randomUUID());
+        when(userRepository.findByEmailIgnoreCase("ada@samosa.test")).thenReturn(Optional.of(user));
+        when(passwordResetTokenRepository.save(any(PasswordResetToken.class)))
+                .thenAnswer(invocation -> invocation.getArgument(0));
+
+        authService.forgotPassword(new ForgotPasswordRequest("ADA@samosa.test"));
+
+        verify(passwordResetTokenRepository).invalidateActiveForUser(eq(user.getId()), any(Instant.class));
+        verify(notificationService).notifyPasswordReset(eq("ada@samosa.test"), anyString());
+    }
+
+    @Test
+    void resetPasswordUpdatesHashRevokesRefreshTokensAndConsumesToken() {
+        User user = new User("ada@samosa.test", passwordEncoder.encode("password1"), "Ada");
+        UUID userId = UUID.randomUUID();
+        ReflectionTestUtils.setField(user, "id", userId);
+        String rawToken = "reset-token";
+        var stored = new PasswordResetToken(userId, TokenHasher.hashToken(rawToken), Instant.now().plusSeconds(600));
+        when(passwordResetTokenRepository.findByTokenHash(TokenHasher.hashToken(rawToken)))
+                .thenReturn(Optional.of(stored));
+        when(userRepository.findById(userId)).thenReturn(Optional.of(user));
+
+        var response = authService.resetPassword(new ResetPasswordRequest(rawToken, "newpass12"));
+
+        assertThat(response.message()).contains("Password updated");
+        assertThat(passwordEncoder.matches("newpass12", user.getPasswordHash())).isTrue();
+        assertThat(stored.getUsedAt()).isNotNull();
+        verify(refreshTokenService).revokeAllForUser(userId, "password_reset");
+    }
+
+    @Test
+    void resetPasswordRejectsUnknownToken() {
+        when(passwordResetTokenRepository.findByTokenHash(any())).thenReturn(Optional.empty());
+
+        assertThatThrownBy(() -> authService.resetPassword(new ResetPasswordRequest("nope", "password1")))
+                .isInstanceOf(InvalidRequestException.class);
+    }
+}
+
+================================================================================
+SECTION: BACKEND - TESTS
+FILE: backend/src/test/java/com/samosajunction/auth/service/RefreshTokenServiceTest.java
+================================================================================
+
+package com.samosajunction.auth.service;
+
+import com.samosajunction.auth.config.AuthProperties;
+import com.samosajunction.auth.entity.RefreshToken;
+import com.samosajunction.auth.repository.RefreshTokenRepository;
+import com.samosajunction.auth.security.TokenHasher;
+import com.samosajunction.auth.support.SecurityAuditLogger;
+import com.samosajunction.common.exception.UnauthorizedException;
+import com.samosajunction.user.entity.Role;
+import com.samosajunction.user.entity.RoleName;
+import com.samosajunction.user.entity.User;
+import com.samosajunction.user.repository.UserRepository;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.extension.ExtendWith;
+import org.mockito.ArgumentCaptor;
+import org.mockito.Mock;
+import org.mockito.junit.jupiter.MockitoExtension;
+import org.springframework.test.util.ReflectionTestUtils;
+
+import java.time.Duration;
+import java.time.Instant;
+import java.util.Optional;
+import java.util.UUID;
+
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.when;
+
+@ExtendWith(MockitoExtension.class)
+class RefreshTokenServiceTest {
+
+    @Mock
+    private RefreshTokenRepository refreshTokenRepository;
+
+    @Mock
+    private UserRepository userRepository;
+
+    @Mock
+    private SecurityAuditLogger auditLogger;
+
+    private RefreshTokenService refreshTokenService;
+
+    @BeforeEach
+    void setUp() {
+        refreshTokenService = new RefreshTokenService(
+                refreshTokenRepository,
+                userRepository,
+                new AuthProperties(
+                        Duration.ofMinutes(30),
+                        false,
+                        "http://localhost:5173",
+                        Duration.ofDays(7),
+                        10,
+                        Duration.ofMinutes(15)
+                ),
+                auditLogger
+        );
+    }
+
+    @Test
+    void rotateIssuesNewTokenAndRevokesOldOne() {
+        UUID userId = UUID.randomUUID();
+        String rawToken = TokenHasher.generateOpaqueToken();
+        var stored = new RefreshToken(userId, TokenHasher.hashToken(rawToken), Instant.now().plusSeconds(3600));
+        ReflectionTestUtils.setField(stored, "id", UUID.randomUUID());
+
+        User user = new User("ada@samosa.test", "hash", "Ada");
+        user.addRole(new Role(RoleName.CUSTOMER));
+        ReflectionTestUtils.setField(user, "id", userId);
+
+        when(refreshTokenRepository.findByTokenHash(TokenHasher.hashToken(rawToken))).thenReturn(Optional.of(stored));
+        when(userRepository.findWithRolesById(userId)).thenReturn(Optional.of(user));
+        when(refreshTokenRepository.save(any(RefreshToken.class))).thenAnswer(invocation -> {
+            RefreshToken token = invocation.getArgument(0);
+            ReflectionTestUtils.setField(token, "id", UUID.randomUUID());
+            return token;
+        });
+
+        var result = refreshTokenService.rotate(rawToken);
+
+        assertThat(result.user().getId()).isEqualTo(userId);
+        assertThat(result.refreshToken().rawToken()).isNotBlank();
+        assertThat(stored.getRevokedAt()).isNotNull();
+        verify(auditLogger).refreshTokenRotated(eq(userId), eq(stored.getId()), any(UUID.class));
+    }
+
+    @Test
+    void rotateDetectsReuseAndRevokesAllUserTokens() {
+        UUID userId = UUID.randomUUID();
+        String rawToken = TokenHasher.generateOpaqueToken();
+        var stored = new RefreshToken(userId, TokenHasher.hashToken(rawToken), Instant.now().plusSeconds(3600));
+        stored.revoke(Instant.now(), UUID.randomUUID());
+        when(refreshTokenRepository.findByTokenHash(TokenHasher.hashToken(rawToken))).thenReturn(Optional.of(stored));
+
+        assertThatThrownBy(() -> refreshTokenService.rotate(rawToken))
+                .isInstanceOf(UnauthorizedException.class);
+        verify(refreshTokenRepository).revokeAllActiveForUser(eq(userId), any(Instant.class));
+        verify(auditLogger).refreshTokenReuseDetected(userId);
+    }
+}
+
+================================================================================
+SECTION: BACKEND - TESTS
+FILE: backend/src/test/java/com/samosajunction/auth/security/JwtServiceTest.java
+================================================================================
+
+package com.samosajunction.auth.security;
+
+import org.junit.jupiter.api.Test;
+
+import java.time.Duration;
+import java.util.UUID;
+
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
+
+class JwtServiceTest {
+
+    private static JwtProperties testProperties() {
+        return new JwtProperties(
+                "test-jwt-secret-at-least-32-bytes!!",
+                Duration.ofHours(1),
+                "samosa-junction-test",
+                "samosa-junction-api-test",
+                Duration.ofSeconds(60)
+        );
+    }
+
+    @Test
+    void createAndParseRoundTrip() {
+        var jwtService = new JwtService(testProperties());
+        UUID userId = UUID.randomUUID();
+
+        String token = jwtService.createAccessToken(userId);
+        var claims = jwtService.parse(token);
+
+        assertThat(claims.getSubject()).isEqualTo(userId.toString());
+        assertThat(claims.getIssuer()).isEqualTo("samosa-junction-test");
+        assertThat(claims.getAudience()).containsExactly("samosa-junction-api-test");
+        assertThat(jwtService.getExpirationSeconds()).isEqualTo(3600L);
+    }
+
+    @Test
+    void rejectsShortSecret() {
+        assertThatThrownBy(() -> new JwtService(new JwtProperties(
+                "too-short",
+                Duration.ofMinutes(5),
+                "issuer",
+                "audience",
+                Duration.ofSeconds(30)
+        ))).isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("at least 32 bytes");
+    }
+
+    @Test
+    void rejectsTamperedToken() {
+        var jwtService = new JwtService(testProperties());
+        String token = jwtService.createAccessToken(UUID.randomUUID());
+
+        assertThatThrownBy(() -> jwtService.parse(token + "x"))
+                .isInstanceOf(InvalidJwtException.class);
+    }
+
+    @Test
+    void rejectsWrongAudience() {
+        var jwtService = new JwtService(testProperties());
+        String token = jwtService.createAccessToken(UUID.randomUUID());
+        var otherAudience = new JwtService(new JwtProperties(
+                "test-jwt-secret-at-least-32-bytes!!",
+                Duration.ofHours(1),
+                "samosa-junction-test",
+                "other-audience",
+                Duration.ofSeconds(60)
+        ));
+
+        assertThatThrownBy(() -> otherAudience.parse(token))
+                .isInstanceOf(InvalidJwtException.class);
+    }
+}
+
+================================================================================
+SECTION: BACKEND - TESTS
+FILE: backend/src/test/java/com/samosajunction/web/AuthWebMvcTest.java
+================================================================================
+
+package com.samosajunction.web;
+
+import com.samosajunction.auth.controller.AuthController;
+import com.samosajunction.auth.dto.AuthResponse;
+import com.samosajunction.auth.dto.ForgotPasswordResponse;
+import com.samosajunction.auth.dto.MessageResponse;
+import com.samosajunction.auth.security.JwtService;
+import com.samosajunction.auth.service.AuthService;
+import com.samosajunction.auth.service.LoginRateLimiter;
+import com.samosajunction.auth.service.RefreshTokenService;
+import com.samosajunction.auth.support.SecurityAuditLogger;
+import com.samosajunction.common.exception.UnauthorizedException;
+import com.samosajunction.testsupport.SecureWebMvc;
+import com.samosajunction.user.dto.UserResponse;
+import com.samosajunction.user.repository.UserRepository;
+import org.junit.jupiter.api.Test;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.boot.test.autoconfigure.web.servlet.WebMvcTest;
+import org.springframework.http.MediaType;
+import org.springframework.security.authentication.AuthenticationManager;
+import org.springframework.test.context.bean.override.mockito.MockitoBean;
+import org.springframework.test.web.servlet.MockMvc;
+
+import java.time.Instant;
+import java.util.Set;
+import java.util.UUID;
+
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.Mockito.when;
+import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
+import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
+import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
+
+@WebMvcTest(controllers = AuthController.class)
+@SecureWebMvc
+class AuthWebMvcTest {
+
+    @Autowired
+    private MockMvc mockMvc;
+
+    @MockitoBean
+    private AuthService authService;
+
+    @MockitoBean
+    private JwtService jwtService;
+
+    @MockitoBean
+    private UserRepository userRepository;
+
+    @MockitoBean
+    private AuthenticationManager authenticationManager;
+
+    @MockitoBean
+    private LoginRateLimiter loginRateLimiter;
+
+    @MockitoBean
+    private RefreshTokenService refreshTokenService;
+
+    @MockitoBean
+    private SecurityAuditLogger securityAuditLogger;
+
+    @Test
+    void registerRejectsShortPassword() throws Exception {
+        mockMvc.perform(post("/api/auth/register")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"email":"ada@samosa.test","password":"short","fullName":"Ada"}
+                                """))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.code").value("INVALID_REQUEST"));
+    }
+
+    @Test
+    void loginMapsBadCredentialsTo401() throws Exception {
+        when(authService.login(any(), any())).thenThrow(new UnauthorizedException("Invalid email or password"));
+
+        mockMvc.perform(post("/api/auth/login")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"email":"ada@samosa.test","password":"password1"}
+                                """))
+                .andExpect(status().isUnauthorized())
+                .andExpect(jsonPath("$.code").value("UNAUTHORIZED"))
+                .andExpect(jsonPath("$.message").value("Invalid email or password"));
+    }
+
+    @Test
+    void registerReturns201() throws Exception {
+        when(authService.register(any())).thenReturn(new AuthResponse(
+                "jwt",
+                "Bearer",
+                900,
+                "refresh",
+                604800,
+                new UserResponse(
+                        UUID.randomUUID(),
+                        "ada@samosa.test",
+                        "Ada",
+                        null,
+                        null,
+                        null,
+                        null,
+                        null,
+                        null,
+                        false,
+                        Set.of("CUSTOMER"),
+                        Instant.now()
+                )
+        ));
+
+        mockMvc.perform(post("/api/auth/register")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"email":"ada@samosa.test","password":"password1","fullName":"Ada Lovelace"}
+                                """))
+                .andExpect(status().isCreated())
+                .andExpect(jsonPath("$.accessToken").value("jwt"))
+                .andExpect(jsonPath("$.refreshToken").value("refresh"))
+                .andExpect(jsonPath("$.tokenType").value("Bearer"));
+    }
+
+    @Test
+    void forgotPasswordIsPublic() throws Exception {
+        when(authService.forgotPassword(any()))
+                .thenReturn(new ForgotPasswordResponse("If an account exists for this email, a password reset link was issued.", null));
+
+        mockMvc.perform(post("/api/auth/forgot-password")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"email":"ada@samosa.test"}
+                                """))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.message").exists());
+    }
+
+    @Test
+    void resetPasswordIsPublic() throws Exception {
+        when(authService.resetPassword(any())).thenReturn(new MessageResponse("Password updated. You can log in with the new password."));
+
+        mockMvc.perform(post("/api/auth/reset-password")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"token":"abc","password":"password1"}
+                                """))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.message").value("Password updated. You can log in with the new password."));
+    }
+
+    @Test
+    void refreshIsPublic() throws Exception {
+        when(authService.refresh(any())).thenReturn(new AuthResponse(
+                "new-jwt",
+                "Bearer",
+                900,
+                "new-refresh",
+                604800,
+                new UserResponse(
+                        UUID.randomUUID(),
+                        "ada@samosa.test",
+                        "Ada",
+                        null,
+                        null,
+                        null,
+                        null,
+                        null,
+                        null,
+                        false,
+                        Set.of("CUSTOMER"),
+                        Instant.now()
+                )
+        ));
+
+        mockMvc.perform(post("/api/auth/refresh")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"refreshToken":"abc"}
+                                """))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.accessToken").value("new-jwt"));
+    }
+}
+
+================================================================================
+SECTION: BACKEND - TESTS
+FILE: backend/src/test/java/com/samosajunction/web/JwtAuthorizationWebMvcTest.java
+================================================================================
+
+package com.samosajunction.web;
+
+import com.samosajunction.auth.security.JwtProperties;
+import com.samosajunction.auth.security.JwtService;
+import com.samosajunction.staff.controller.StaffController;
+import com.samosajunction.staff.service.StaffAuditService;
+import com.samosajunction.staff.service.StaffOperationsService;
+import com.samosajunction.support.service.SupportService;
+import com.samosajunction.testsupport.SecureWebMvc;
+import com.samosajunction.user.entity.Role;
+import com.samosajunction.user.entity.RoleName;
+import com.samosajunction.user.entity.User;
+import com.samosajunction.user.repository.UserRepository;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.boot.test.autoconfigure.web.servlet.WebMvcTest;
+import org.springframework.test.context.bean.override.mockito.MockitoBean;
+import org.springframework.test.context.TestPropertySource;
+import org.springframework.test.web.servlet.MockMvc;
+
+import java.time.Duration;
+import java.util.Optional;
+import java.util.Set;
+import java.util.UUID;
+
+import static org.mockito.Mockito.when;
+import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
+import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
+import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
+
+@WebMvcTest(controllers = StaffController.class)
+@SecureWebMvc
+@TestPropertySource(properties = {
+        "samosa.jwt.secret=test-jwt-secret-at-least-32-bytes!!",
+        "samosa.jwt.expiration=15m",
+        "samosa.jwt.issuer=samosa-junction-test",
+        "samosa.jwt.audience=samosa-junction-api-test",
+        "samosa.jwt.clock-skew=60s"
+})
+class JwtAuthorizationWebMvcTest {
+
+    private static final UUID CUSTOMER_ID = UUID.fromString("11111111-1111-4111-8111-111111111111");
+    private static final UUID STAFF_ID = UUID.fromString("22222222-2222-4222-8222-222222222222");
+
+    @Autowired
+    private MockMvc mockMvc;
+
+    @Autowired
+    private JwtService jwtService;
+
+    @MockitoBean
+    private UserRepository userRepository;
+
+    @MockitoBean
+    private StaffOperationsService staffOperationsService;
+
+    @MockitoBean
+    private StaffAuditService staffAuditService;
+
+    @MockitoBean
+    private SupportService supportService;
+
+    private String customerToken;
+    private String staffToken;
+
+    @BeforeEach
+    void setUp() {
+        customerToken = jwtService.createAccessToken(CUSTOMER_ID);
+        staffToken = jwtService.createAccessToken(STAFF_ID);
+
+        User customer = new User("customer@samosa.test", "hash", "Customer");
+        customer.addRole(new Role(RoleName.CUSTOMER));
+        org.springframework.test.util.ReflectionTestUtils.setField(customer, "id", CUSTOMER_ID);
+
+        User staff = new User("staff@samosa.test", "hash", "Staff");
+        staff.addRole(new Role(RoleName.STAFF));
+        org.springframework.test.util.ReflectionTestUtils.setField(staff, "id", STAFF_ID);
+
+        when(userRepository.findWithRolesById(CUSTOMER_ID)).thenReturn(Optional.of(customer));
+        when(userRepository.findWithRolesById(STAFF_ID)).thenReturn(Optional.of(staff));
+    }
+
+    @Test
+    void staffEndpointRequiresJwt() throws Exception {
+        mockMvc.perform(get("/api/staff/dashboard"))
+                .andExpect(status().isUnauthorized())
+                .andExpect(jsonPath("$.code").value("UNAUTHORIZED"));
+    }
+
+    @Test
+    void customerJwtCannotAccessStaffEndpoint() throws Exception {
+        mockMvc.perform(get("/api/staff/dashboard")
+                        .header("Authorization", "Bearer " + customerToken))
+                .andExpect(status().isForbidden())
+                .andExpect(jsonPath("$.code").value("FORBIDDEN"));
+    }
+
+    @Test
+    void staffJwtCanAccessStaffEndpoint() throws Exception {
+        when(staffOperationsService.dashboard()).thenReturn(
+                new com.samosajunction.staff.dto.StaffDashboardResponse(
+                        java.time.Instant.parse("2026-01-01T00:00:00Z"),
+                        0,
+                        java.math.BigDecimal.ZERO,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0
+                )
+        );
+
+        mockMvc.perform(get("/api/staff/dashboard")
+                        .header("Authorization", "Bearer " + staffToken))
+                .andExpect(status().isOk());
+    }
+
+    @Test
+    void malformedJwtIsRejected() throws Exception {
+        mockMvc.perform(get("/api/staff/dashboard")
+                        .header("Authorization", "Bearer not-a-jwt"))
+                .andExpect(status().isUnauthorized());
+    }
+}
+
+================================================================================
+SECTION: FRONTEND
+FILE: frontend/src/types/auth.ts
+================================================================================
+
+import type { User } from '@/types/user'
+
+
+export type AuthResponse = {
+  accessToken: string
+  tokenType: string
+  expiresInSeconds: number
+  user: User
+}
+
+export type LoginRequest = {
+  email: string
+  password: string
+}
+
+export type RegisterRequest = {
+  email: string
+  password: string
+  fullName: string
+}
+
+export type ForgotPasswordRequest = {
+  email: string
+}
+
+export type ForgotPasswordResponse = {
+  message: string
+  resetPath?: string
+}
+
+export type ResetPasswordRequest = {
+  token: string
+  password: string
+}
+
+export type MessageResponse = {
+  message: string
+}
+
+================================================================================
+SECTION: FRONTEND
+FILE: frontend/src/api/authApi.ts
+================================================================================
+
+import { apiClient } from '@/api/client'
+import type {
+  AuthResponse,
+  ForgotPasswordRequest,
+  ForgotPasswordResponse,
+  LoginRequest,
+  MessageResponse,
+  RegisterRequest,
+  ResetPasswordRequest,
+} from '@/types/auth'
+
+
+export const authApi = {
+  register(body: RegisterRequest) {
+    return apiClient.post<AuthResponse>('/api/auth/register', body).then((response) => response.data)
+  },
+
+  login(body: LoginRequest) {
+    return apiClient.post<AuthResponse>('/api/auth/login', body).then((response) => response.data)
+  },
+
+  forgotPassword(body: ForgotPasswordRequest) {
+    return apiClient.post<ForgotPasswordResponse>('/api/auth/forgot-password', body).then((response) => response.data)
+  },
+
+  resetPassword(body: ResetPasswordRequest) {
+    return apiClient.post<MessageResponse>('/api/auth/reset-password', body).then((response) => response.data)
+  },
+}
+
+================================================================================
+SECTION: FRONTEND
+FILE: frontend/src/api/tokenStore.ts
+================================================================================
+
+
+const TOKEN_KEY = 'samosa.accessToken'
+
+type Listener = () => void
+
+const listeners = new Set<Listener>()
+
+function notify() {
+  listeners.forEach((listener) => listener())
+}
+
+export const tokenStore = {
+  get(): string | null {
+    return window.localStorage.getItem(TOKEN_KEY)
+  },
+
+  set(token: string) {
+    window.localStorage.setItem(TOKEN_KEY, token)
+    notify()
+  },
+
+  clear() {
+    window.localStorage.removeItem(TOKEN_KEY)
+    notify()
+  },
+
+  subscribe(listener: Listener) {
+    listeners.add(listener)
+    return () => {
+      listeners.delete(listener)
+    }
+  },
+}
+
+================================================================================
+SECTION: FRONTEND
+FILE: frontend/src/context/AuthContext.tsx
+================================================================================
+
+import { createContext, type ReactNode } from 'react'
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
+import { authApi } from '@/api/authApi'
+import { tokenStore } from '@/api/tokenStore'
+import { userApi } from '@/api/userApi'
+import { useToken } from '@/hooks/useToken'
+import type { LoginRequest, RegisterRequest } from '@/types/auth'
+import type { User } from '@/types/user'
+
+
+export type AuthStatus = 'loading' | 'anonymous' | 'authenticated'
+
+export type AuthContextValue = {
+  status: AuthStatus
+  user: User | undefined
+  login: (body: LoginRequest) => Promise<void>
+  register: (body: RegisterRequest) => Promise<void>
+  logout: () => void
+}
+
+export const AuthContext = createContext<AuthContextValue | undefined>(undefined)
+
+export function AuthProvider({ children }: { children: ReactNode }) {
+  const token = useToken()
+  const queryClient = useQueryClient()
+
+  const meQuery = useQuery({
+    queryKey: ['users', 'me'],
+    queryFn: userApi.me,
+    enabled: Boolean(token),
+    retry: false,
+    staleTime: 60_000,
+  })
+
+  const loginMutation = useMutation({
+    mutationFn: authApi.login,
+    onSuccess(response) {
+      tokenStore.set(response.accessToken)
+      queryClient.setQueryData(['users', 'me'], response.user)
+    },
+  })
+
+  const registerMutation = useMutation({
+    mutationFn: authApi.register,
+    onSuccess(response) {
+      tokenStore.set(response.accessToken)
+      queryClient.setQueryData(['users', 'me'], response.user)
+    },
+  })
+
+  let status: AuthStatus = 'anonymous'
+  if (token) {
+    if ((meQuery.isLoading || meQuery.isFetching) && !meQuery.data) {
+      status = 'loading'
+    } else if (meQuery.data) {
+      status = 'authenticated'
+    }
+  }
+
+  const value: AuthContextValue = {
+    status,
+    user: meQuery.data,
+    login: async (body) => {
+      await loginMutation.mutateAsync(body)
+    },
+    register: async (body) => {
+      await registerMutation.mutateAsync(body)
+    },
+    logout() {
+      tokenStore.clear()
+      queryClient.removeQueries({ queryKey: ['users', 'me'] })
+        queryClient.removeQueries({ queryKey: ['recommendations'] })
+        queryClient.removeQueries({ queryKey: ['cart'] })
+        queryClient.removeQueries({ queryKey: ['wallet'] })
+        queryClient.removeQueries({ queryKey: ['orders'] })
+        queryClient.removeQueries({ queryKey: ['complaints'] })
+        queryClient.removeQueries({ queryKey: ['staff'] })
+        queryClient.removeQueries({ queryKey: ['kitchen'] })
+    },
+  }
+
+  return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>
+}
+
+================================================================================
+SECTION: FRONTEND
+FILE: frontend/src/hooks/useAuth.ts
+================================================================================
+
+import { useContext } from 'react'
+import { AuthContext } from '@/context/AuthContext'
+
+
+export function useAuth() {
+  const context = useContext(AuthContext)
+  if (!context) {
+    throw new Error('useAuth must be used inside AuthProvider')
+  }
+  return context
+}
+
+================================================================================
+SECTION: FRONTEND
+FILE: frontend/src/pages/LoginPage.tsx
+================================================================================
+
+import { zodResolver } from '@hookform/resolvers/zod'
+import { useForm } from 'react-hook-form'
+import { Link, useLocation, useNavigate } from 'react-router-dom'
+import { z } from 'zod'
+import { AuthShell } from '@/components/auth/AuthShell'
+import { Alert } from '@/components/ui/Alert'
+import { Button } from '@/components/ui/Button'
+import { Field } from '@/components/ui/Field'
+import { useAuth } from '@/hooks/useAuth'
+import { errorMessage, isApiRequestError } from '@/utils/errors'
+
+
+const schema = z.object({
+  email: z.string().trim().email('Enter a valid email'),
+  password: z.string().min(1, 'Password is required').max(72, 'Password is too long'),
+})
+
+type FormValues = z.infer<typeof schema>
+
+export function LoginPage() {
+  const { login } = useAuth()
+  const navigate = useNavigate()
+  const location = useLocation()
+  const from = (location.state as { from?: string } | null)?.from ?? '/'
+
+  const form = useForm<FormValues>({
+    resolver: zodResolver(schema),
+    defaultValues: { email: '', password: '' },
+  })
+
+  async function onSubmit(values: FormValues) {
+    try {
+      await login(values)
+      navigate(from, { replace: true })
+    } catch (error) {
+      form.setError('root', { message: errorMessage(error, 'Unable to log in.') })
+      if (isApiRequestError(error)) {
+        for (const fieldError of error.fieldErrors) {
+          if (fieldError.field === 'email' || fieldError.field === 'password') {
+            form.setError(fieldError.field, { message: fieldError.message })
+          }
+        }
+      }
+    }
+  }
+
+  return (
+    <AuthShell title="Welcome back" subtitle="Pick up where you left off — your tray is waiting.">
+      <form className="space-y-4" onSubmit={form.handleSubmit(onSubmit)} noValidate>
+        {form.formState.errors.root?.message ? <Alert>{form.formState.errors.root.message}</Alert> : null}
+        <Field label="Email" type="email" autoComplete="email" {...form.register('email')} error={form.formState.errors.email?.message} />
+        <Field
+          label="Password"
+          type="password"
+          autoComplete="current-password"
+          {...form.register('password')}
+          error={form.formState.errors.password?.message}
+        />
+        <div className="flex justify-end">
+          <Link to="/forgot-password" className="text-sm font-semibold text-saffron hover:text-saffron-dark">
+            Forgot password?
+          </Link>
+        </div>
+        <Button type="submit" pending={form.formState.isSubmitting} className="w-full">
+          Log in
+        </Button>
+      </form>
+      <p className="mt-6 text-sm text-ink/65">
+        New here?{' '}
+        <Link to="/register" className="font-semibold text-saffron">
+          Create an account
+        </Link>
+      </p>
+    </AuthShell>
+  )
+}
+
+================================================================================
+SECTION: FRONTEND
+FILE: frontend/src/pages/RegisterPage.tsx
+================================================================================
+
+import { zodResolver } from '@hookform/resolvers/zod'
+import { useForm } from 'react-hook-form'
+import { Link, useNavigate } from 'react-router-dom'
+import { z } from 'zod'
+import { AuthShell } from '@/components/auth/AuthShell'
+import { Alert } from '@/components/ui/Alert'
+import { Button } from '@/components/ui/Button'
+import { Field } from '@/components/ui/Field'
+import { useAuth } from '@/hooks/useAuth'
+import { errorMessage, isApiRequestError } from '@/utils/errors'
+
+
+const schema = z.object({
+  fullName: z.string().trim().min(1, 'Name is required').max(120, 'Name is too long'),
+  email: z.string().trim().email('Enter a valid email').max(320),
+  password: z.string().min(8, 'Use at least 8 characters').max(72, 'Password is too long'),
+})
+
+type FormValues = z.infer<typeof schema>
+
+export function RegisterPage() {
+  const { register } = useAuth()
+  const navigate = useNavigate()
+  const form = useForm<FormValues>({
+    resolver: zodResolver(schema),
+    defaultValues: { fullName: '', email: '', password: '' },
+  })
+
+  async function onSubmit(values: FormValues) {
+    try {
+      await register(values)
+      navigate('/', { replace: true })
+    } catch (error) {
+      form.setError('root', { message: errorMessage(error, 'Unable to create the account.') })
+      if (isApiRequestError(error)) {
+        for (const fieldError of error.fieldErrors) {
+          if (fieldError.field === 'email' || fieldError.field === 'password' || fieldError.field === 'fullName') {
+            form.setError(fieldError.field, { message: fieldError.message })
+          }
+        }
+      }
+    }
+  }
+
+  return (
+    <AuthShell
+      title="Create your account"
+      subtitle="Create an account to order, keep a wallet, and track every samosa."
+    >
+      <form className="space-y-4" onSubmit={form.handleSubmit(onSubmit)} noValidate>
+        {form.formState.errors.root?.message ? <Alert>{form.formState.errors.root.message}</Alert> : null}
+        <Field label="Full name" autoComplete="name" {...form.register('fullName')} error={form.formState.errors.fullName?.message} />
+        <Field label="Email" type="email" autoComplete="email" {...form.register('email')} error={form.formState.errors.email?.message} />
+        <Field
+          label="Password"
+          type="password"
+          autoComplete="new-password"
+          hint="At least 8 characters."
+          {...form.register('password')}
+          error={form.formState.errors.password?.message}
+        />
+        <Button type="submit" pending={form.formState.isSubmitting} className="w-full">
+          Create account
+        </Button>
+      </form>
+      <p className="mt-6 text-sm text-ink/65">
+        Already registered?{' '}
+        <Link to="/login" className="font-semibold text-saffron">
+          Log in
+        </Link>
+      </p>
+    </AuthShell>
+  )
+}
+
+================================================================================
+SECTION: FRONTEND
+FILE: frontend/src/pages/ForgotPasswordPage.tsx
+================================================================================
+
+import { zodResolver } from '@hookform/resolvers/zod'
+import { useState } from 'react'
+import { useForm } from 'react-hook-form'
+import { Link } from 'react-router-dom'
+import { z } from 'zod'
+import { authApi } from '@/api/authApi'
+import { AuthShell } from '@/components/auth/AuthShell'
+import { Alert } from '@/components/ui/Alert'
+import { Button } from '@/components/ui/Button'
+import { Field } from '@/components/ui/Field'
+import { errorMessage, isApiRequestError } from '@/utils/errors'
+
+
+const schema = z.object({
+  email: z.string().trim().email('Enter a valid email').max(320),
+})
+
+type FormValues = z.infer<typeof schema>
+
+export function ForgotPasswordPage() {
+  const [result, setResult] = useState<{ message: string; resetPath?: string } | null>(null)
+  const form = useForm<FormValues>({
+    resolver: zodResolver(schema),
+    defaultValues: { email: '' },
+  })
+
+  async function onSubmit(values: FormValues) {
+    try {
+      const response = await authApi.forgotPassword(values)
+      setResult({ message: response.message, resetPath: response.resetPath })
+    } catch (error) {
+      form.setError('root', { message: errorMessage(error, 'Unable to start a password reset.') })
+      if (isApiRequestError(error)) {
+        for (const fieldError of error.fieldErrors) {
+          if (fieldError.field === 'email') {
+            form.setError('email', { message: fieldError.message })
+          }
+        }
+      }
+    }
+  }
+
+  return (
+    <AuthShell
+      title="Forgot your password?"
+      subtitle="Enter the email on your account. We’ll only send a reset if we recognise it."
+    >
+      {result ? (
+        <div className="space-y-4">
+          <Alert tone="success">{result.message}</Alert>
+          {result.resetPath ? (
+            <p className="text-sm text-ink/70">You can set a new password now.</p>
+          ) : (
+            <p className="text-sm text-ink/70">If an account exists, check your inbox for the next step.</p>
+          )}
+          {result.resetPath ? (
+            <Link
+              to={result.resetPath}
+              className="inline-flex w-full items-center justify-center rounded-full bg-saffron px-5 py-2.5 text-sm font-semibold text-cream hover:bg-saffron-dark"
+            >
+              Continue to reset password
+            </Link>
+          ) : null}
+          <Link to="/login" className="block text-center text-sm font-semibold text-saffron">
+            Back to log in
+          </Link>
+        </div>
+      ) : (
+        <form className="space-y-4" onSubmit={form.handleSubmit(onSubmit)} noValidate>
+          {form.formState.errors.root?.message ? <Alert>{form.formState.errors.root.message}</Alert> : null}
+          <Field
+            label="Email"
+            type="email"
+            autoComplete="email"
+            {...form.register('email')}
+            error={form.formState.errors.email?.message}
+          />
+          <Button type="submit" pending={form.formState.isSubmitting} className="w-full">
+            Send reset link
+          </Button>
+          <p className="text-center text-sm text-ink/65">
+            Remembered it?{' '}
+            <Link to="/login" className="font-semibold text-saffron">
+              Log in
+            </Link>
+          </p>
+        </form>
+      )}
+    </AuthShell>
+  )
+}
+
+================================================================================
+SECTION: FRONTEND
+FILE: frontend/src/pages/ResetPasswordPage.tsx
+================================================================================
+
+import { zodResolver } from '@hookform/resolvers/zod'
+import { useState } from 'react'
+import { useForm } from 'react-hook-form'
+import { Link, useSearchParams } from 'react-router-dom'
+import { z } from 'zod'
+import { authApi } from '@/api/authApi'
+import { AuthShell } from '@/components/auth/AuthShell'
+import { Alert } from '@/components/ui/Alert'
+import { Button } from '@/components/ui/Button'
+import { Field } from '@/components/ui/Field'
+import { errorMessage, isApiRequestError } from '@/utils/errors'
+
+
+const schema = z.object({
+  token: z.string().trim().min(1, 'Reset token is required'),
+  password: z.string().min(8, 'Use at least 8 characters').max(72, 'Password is too long'),
+})
+
+type FormValues = z.infer<typeof schema>
+
+export function ResetPasswordPage() {
+  const [params] = useSearchParams()
+  const [done, setDone] = useState(false)
+  const form = useForm<FormValues>({
+    resolver: zodResolver(schema),
+    defaultValues: { token: params.get('token') ?? '', password: '' },
+  })
+
+  async function onSubmit(values: FormValues) {
+    try {
+      await authApi.resetPassword(values)
+      setDone(true)
+    } catch (error) {
+      form.setError('root', { message: errorMessage(error, 'Unable to reset the password.') })
+      if (isApiRequestError(error)) {
+        for (const fieldError of error.fieldErrors) {
+          if (fieldError.field === 'token' || fieldError.field === 'password') {
+            form.setError(fieldError.field, { message: fieldError.message })
+          }
+        }
+      }
+    }
+  }
+
+  return (
+    <AuthShell title="Choose a new password" subtitle="The token is single-use and expires in 30 minutes.">
+      {done ? (
+        <div className="space-y-4">
+          <Alert tone="success">Password updated. You can log in with the new password.</Alert>
+          <Link
+            to="/login"
+            className="inline-flex w-full items-center justify-center rounded-full bg-saffron px-5 py-2.5 text-sm font-semibold text-cream hover:bg-saffron-dark"
+          >
+            Go to log in
+          </Link>
+        </div>
+      ) : (
+        <form className="space-y-4" onSubmit={form.handleSubmit(onSubmit)} noValidate>
+          {form.formState.errors.root?.message ? <Alert>{form.formState.errors.root.message}</Alert> : null}
+          <Field
+            label="Reset token"
+            autoComplete="off"
+            hint="Filled automatically from the reset link."
+            {...form.register('token')}
+            error={form.formState.errors.token?.message}
+          />
+          <Field
+            label="New password"
+            type="password"
+            autoComplete="new-password"
+            {...form.register('password')}
+            error={form.formState.errors.password?.message}
+          />
+          <Button type="submit" pending={form.formState.isSubmitting} className="w-full">
+            Update password
+          </Button>
+        </form>
+      )}
+    </AuthShell>
+  )
+}

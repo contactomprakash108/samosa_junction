@@ -8,6 +8,9 @@ import org.springframework.security.core.userdetails.UserDetails;
 import java.util.Collection;
 import java.util.UUID;
 
+// AI-ASSISTED: Cursor
+// PROMPT: UserDetails principal with separate JWT and credential verification factories
+// ACCEPTED-BY: omprakash
 public final class UserPrincipal implements UserDetails {
 
     private final UUID id;
@@ -30,17 +33,32 @@ public final class UserPrincipal implements UserDetails {
         this.authorities = authorities;
     }
 
-    public static UserPrincipal from(User user) {
-        var authorities = user.getRoles().stream()
-                .map(role -> new SimpleGrantedAuthority("ROLE_" + role.getName().name()))
-                .toList();
+    /** Used by {@code AuthenticationManager} during password login. */
+    public static UserPrincipal forCredentialVerification(User user) {
         return new UserPrincipal(
                 user.getId(),
                 user.getEmail(),
                 user.getPasswordHash(),
                 user.isEnabled(),
-                authorities
+                toAuthorities(user)
         );
+    }
+
+    /** Used after JWT validation; password hash is not needed in the security context. */
+    public static UserPrincipal forAuthenticatedUser(User user) {
+        return new UserPrincipal(
+                user.getId(),
+                user.getEmail(),
+                null,
+                user.isEnabled(),
+                toAuthorities(user)
+        );
+    }
+
+    private static Collection<? extends GrantedAuthority> toAuthorities(User user) {
+        return user.getRoles().stream()
+                .map(role -> new SimpleGrantedAuthority("ROLE_" + role.getName().name()))
+                .toList();
     }
 
     public UUID getId() {

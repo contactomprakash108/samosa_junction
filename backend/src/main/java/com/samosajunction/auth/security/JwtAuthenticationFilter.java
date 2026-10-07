@@ -17,6 +17,9 @@ import org.springframework.web.filter.OncePerRequestFilter;
 import java.io.IOException;
 import java.util.UUID;
 
+// AI-ASSISTED: Cursor
+// PROMPT: Harden JWT filter with typed failures and authenticated principal factory
+// ACCEPTED-BY: omprakash
 @Component
 public class JwtAuthenticationFilter extends OncePerRequestFilter {
 
@@ -54,21 +57,26 @@ public class JwtAuthenticationFilter extends OncePerRequestFilter {
             UUID userId = UUID.fromString(claims.getSubject());
             userRepository.findWithRolesById(userId)
                     .filter(user -> user.isEnabled())
-                    .ifPresent(user -> {
-                        var principal = UserPrincipal.from(user);
-                        var authentication = new UsernamePasswordAuthenticationToken(
-                                principal,
-                                null,
-                                principal.getAuthorities()
-                        );
-                        authentication.setDetails(new WebAuthenticationDetailsSource().buildDetails(request));
-                        SecurityContextHolder.getContext().setAuthentication(authentication);
-                    });
-        } catch (Exception ex) {
+                    .ifPresent(user -> setAuthentication(request, user));
+        } catch (InvalidJwtException ex) {
             log.debug("Rejecting JWT: {}", ex.getMessage());
+            SecurityContextHolder.clearContext();
+        } catch (IllegalArgumentException ex) {
+            log.debug("Rejecting JWT with invalid subject");
             SecurityContextHolder.clearContext();
         }
 
         filterChain.doFilter(request, response);
+    }
+
+    private void setAuthentication(HttpServletRequest request, com.samosajunction.user.entity.User user) {
+        var principal = UserPrincipal.forAuthenticatedUser(user);
+        var authentication = new UsernamePasswordAuthenticationToken(
+                principal,
+                null,
+                principal.getAuthorities()
+        );
+        authentication.setDetails(new WebAuthenticationDetailsSource().buildDetails(request));
+        SecurityContextHolder.getContext().setAuthentication(authentication);
     }
 }
